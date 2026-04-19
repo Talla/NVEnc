@@ -295,23 +295,25 @@ static inline cudaError_t launch_motion_compensate(
     return cudaGetLastError();
 }
 
-// N-ref bounded blend: out = cur + clamp(avg(mc_ref[0..N-1] + cur) - cur, -limit, +limit).
-// For NREFS = 1..3 causal refs. Template-specialized per N for unrolled loops.
-// Unused ref pointers (e.g. r2 when NREFS=1) may be nullptr — never dereferenced.
-// N-ref blend with per-block thSAD gating: refs whose block SAD exceeds thSAD are
-// excluded from the average for that block (per-pixel, since SAD is looked up per block).
-// This is the mechanism that differentiates media_processor's heavy_cs (thSAD=500) from
-// medium_cs (thSAD=300) — higher thSAD accepts more refs → more denoising in fast-motion
-// regions where ME is less reliable.
+// N-ref bounded blend with per-block thSAD gating. Refs whose block SAD exceeds thSAD
+// are excluded from the average for that block.
+//
+// Phase 5g/5h supported NREFS=1..3 (causal-only, up to tr=3 past refs).
+// Phase 5f extends to NREFS=1..6 to accommodate bidirectional mode:
+//   tr=1 bidir → 2 refs (1 past + 1 future)
+//   tr=2 bidir → 4 refs
+//   tr=3 bidir → 6 refs
+// Also covers causal-only edge cases at clip boundaries where full bidir window isn't
+// available (uses whatever refs exist, 0..2*tr).
+//
+// Unused ref pointers may be nullptr — the if-constexpr gates ensure no dereference.
 template<typename T, int NREFS, int BLOCK_SIZE>
 __global__ void kernel_temporal_blend_nref(
     const T* __restrict__ cur,
-    const T* __restrict__ r0,
-    const T* __restrict__ r1,
-    const T* __restrict__ r2,
-    const MVBlock* __restrict__ mv0,
-    const MVBlock* __restrict__ mv1,
-    const MVBlock* __restrict__ mv2,
+    const T* __restrict__ r0, const T* __restrict__ r1, const T* __restrict__ r2,
+    const T* __restrict__ r3, const T* __restrict__ r4, const T* __restrict__ r5,
+    const MVBlock* __restrict__ mv0, const MVBlock* __restrict__ mv1, const MVBlock* __restrict__ mv2,
+    const MVBlock* __restrict__ mv3, const MVBlock* __restrict__ mv4, const MVBlock* __restrict__ mv5,
     const int mv_blocks_x,
     const int width, const int height, const int pitch_pixels,
     const int thSAD,
@@ -326,18 +328,28 @@ __global__ void kernel_temporal_blend_nref(
     const int bx = x / BLOCK_SIZE;
     const int by = y / BLOCK_SIZE;
     const int block_idx = by * mv_blocks_x + bx;
+    const int px_off = y * pitch_pixels + x;
 
-    const int c = (int)cur[y * pitch_pixels + x];
+    const int c = (int)cur[px_off];
     int sum = c;
     int count = 1;
     if constexpr (NREFS >= 1) {
-        if (mv0[block_idx].sad <= thSAD) { sum += (int)r0[y * pitch_pixels + x]; count++; }
+        if (mv0[block_idx].sad <= thSAD) { sum += (int)r0[px_off]; count++; }
     }
     if constexpr (NREFS >= 2) {
-        if (mv1[block_idx].sad <= thSAD) { sum += (int)r1[y * pitch_pixels + x]; count++; }
+        if (mv1[block_idx].sad <= thSAD) { sum += (int)r1[px_off]; count++; }
     }
     if constexpr (NREFS >= 3) {
-        if (mv2[block_idx].sad <= thSAD) { sum += (int)r2[y * pitch_pixels + x]; count++; }
+        if (mv2[block_idx].sad <= thSAD) { sum += (int)r2[px_off]; count++; }
+    }
+    if constexpr (NREFS >= 4) {
+        if (mv3[block_idx].sad <= thSAD) { sum += (int)r3[px_off]; count++; }
+    }
+    if constexpr (NREFS >= 5) {
+        if (mv4[block_idx].sad <= thSAD) { sum += (int)r4[px_off]; count++; }
+    }
+    if constexpr (NREFS >= 6) {
+        if (mv5[block_idx].sad <= thSAD) { sum += (int)r5[px_off]; count++; }
     }
     const int avg = (sum + count / 2) / count;
 
@@ -347,14 +359,16 @@ __global__ void kernel_temporal_blend_nref(
     int o = c + delta;
     if (o < 0) o = 0;
     if (o > pix_max) o = pix_max;
-    out[y * pitch_pixels + x] = (T)o;
+    out[px_off] = (T)o;
 }
 
 template<typename T, int NREFS, int BLOCK_SIZE>
 static inline cudaError_t launch_temporal_blend_nref(
     const T* d_cur,
     const T* d_r0, const T* d_r1, const T* d_r2,
+    const T* d_r3, const T* d_r4, const T* d_r5,
     const MVBlock* d_mv0, const MVBlock* d_mv1, const MVBlock* d_mv2,
+    const MVBlock* d_mv3, const MVBlock* d_mv4, const MVBlock* d_mv5,
     int mv_blocks_x,
     int width, int height, int pitch_pixels,
     int thSAD, int limit_scaled, int pix_max,
@@ -363,8 +377,10 @@ static inline cudaError_t launch_temporal_blend_nref(
     const dim3 block(16, 16, 1);
     const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
     kernel_temporal_blend_nref<T, NREFS, BLOCK_SIZE><<<grid, block, 0, stream>>>(
-        d_cur, d_r0, d_r1, d_r2, d_mv0, d_mv1, d_mv2, mv_blocks_x,
-        width, height, pitch_pixels, thSAD, limit_scaled, pix_max, d_out);
+        d_cur,
+        d_r0, d_r1, d_r2, d_r3, d_r4, d_r5,
+        d_mv0, d_mv1, d_mv2, d_mv3, d_mv4, d_mv5,
+        mv_blocks_x, width, height, pitch_pixels, thSAD, limit_scaled, pix_max, d_out);
     return cudaGetLastError();
 }
 

@@ -34,6 +34,8 @@ NVEncFilterSMDegrain::NVEncFilterSMDegrain() :
     m_ringBuf(),
     m_ringSize(0),
     m_ringIdx(0),
+    m_outputIdx(0),
+    m_flushed(false),
     m_l1Buf(),
     m_l1Width(0),
     m_l1Height(0),
@@ -154,9 +156,11 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
         AddMessage(RGY_LOG_ERROR, _T("failed to allocate coarse MV buffer: %s.\n"), get_err_mes(sts));
         return sts;
     }
-    // One fine-MV buffer per past ref so thSAD gating can read each ref's per-block SAD.
+    // One fine-MV buffer per ref. Bidirectional (Phase 5f) uses up to 2*tr refs
+    // (tr past + tr future), so allocate that many slots.
+    const int max_refs = 2 * tr;
     m_fineMVs.clear();
-    m_fineMVs.resize(tr);
+    m_fineMVs.resize(max_refs);
     for (auto& buf : m_fineMVs) {
         buf = std::unique_ptr<CUMemBuf>(new CUMemBuf(fine_bytes));
         if ((sts = buf->alloc()) != RGY_ERR_NONE) {
@@ -165,9 +169,9 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
         }
     }
 
-    // One MC scratch frame per past ref (tr of them).
+    // One MC scratch frame per ref (2*tr in bidir mode).
     m_mcScratch.clear();
-    m_mcScratch.resize(tr);
+    m_mcScratch.resize(max_refs);
     for (auto& buf : m_mcScratch) {
         buf = std::unique_ptr<CUFrameBuf>(new CUFrameBuf());
         sts = buf->alloc(width, height, prm->frameOut.csp);
@@ -194,6 +198,8 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
 
     m_ringSize = newRingSize;
     m_ringIdx = 0;
+    m_outputIdx = 0;
+    m_flushed = false;
     m_cachedWidth = width;
     m_cachedHeight = height;
     m_cachedTr = tr;
@@ -236,23 +242,26 @@ RGY_ERR NVEncFilterSMDegrain::init(shared_ptr<NVEncFilterParam> pParam, shared_p
 
 RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames,
                                          int *pOutputFrameNum, cudaStream_t stream) {
+    // Phase 5f: bidirectional ME with tr-frame output delay. The filter now produces
+    // N-tr output frames for N inputs, then at EOS emits the remaining tr frames on
+    // successive null-input calls. Callers must honor *pOutputFrameNum = 0 as "no
+    // output this call, keep feeding" and keep calling with null input at EOS until
+    // *pOutputFrameNum stays at 0 and ppOutputFrames[0]==nullptr (flush complete).
+
     *pOutputFrameNum = 1;
     if (ppOutputFrames[0] == nullptr) {
         auto pOutFrame = m_frameBuf[0].get();
         ppOutputFrames[0] = &pOutFrame->frame;
     }
-    ppOutputFrames[0]->picstruct = pInputFrame->picstruct;
 
-    if (pInputFrame->ptr[0] == nullptr) {
-        *pOutputFrameNum = 0;
-        ppOutputFrames[0] = nullptr;
-        return RGY_ERR_NONE;
-    }
-
-    const auto memcpyKind = getCudaMemcpyKind(pInputFrame->mem_type, ppOutputFrames[0]->mem_type);
-    if (memcpyKind != cudaMemcpyDeviceToDevice) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain: only supported on device memory.\n"));
-        return RGY_ERR_INVALID_PARAM;
+    const bool is_flush = (pInputFrame == nullptr || pInputFrame->ptr[0] == nullptr);
+    if (!is_flush) {
+        ppOutputFrames[0]->picstruct = pInputFrame->picstruct;
+        const auto memcpyKind = getCudaMemcpyKind(pInputFrame->mem_type, ppOutputFrames[0]->mem_type);
+        if (memcpyKind != cudaMemcpyDeviceToDevice) {
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain: only supported on device memory.\n"));
+            return RGY_ERR_INVALID_PARAM;
+        }
     }
 
     auto prm = std::dynamic_pointer_cast<NVEncFilterParamSMDegrain>(m_param);
@@ -275,127 +284,158 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
     const int thSAD_scaled = prm->smdegrain.thSAD << (bit_depth - 8);
 
     if (bit_depth == 8) {
-        return runDenoiseImpl<uint8_t>(pInputFrame, ppOutputFrames, stream, pix_max, limit_scaled, thSAD_scaled);
+        return runDenoiseImpl<uint8_t>(pInputFrame, ppOutputFrames, pOutputFrameNum, stream, pix_max, limit_scaled, thSAD_scaled);
     }
-    return runDenoiseImpl<uint16_t>(pInputFrame, ppOutputFrames, stream, pix_max, limit_scaled, thSAD_scaled);
+    return runDenoiseImpl<uint16_t>(pInputFrame, ppOutputFrames, pOutputFrameNum, stream, pix_max, limit_scaled, thSAD_scaled);
 }
 
 template<typename T>
 RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames,
+    int *pOutputFrameNum,
     cudaStream_t stream, int pix_max, int limit_scaled, int thSAD_scaled
 ) {
     RGY_ERR sts = RGY_ERR_NONE;
     auto prm = std::dynamic_pointer_cast<NVEncFilterParamSMDegrain>(m_param);
-
-    // Stash the full current frame into the ring.
-    const int cur_slot = m_ringIdx % m_ringSize;
-    CUFrameBuf* curRing = m_ringBuf[cur_slot].get();
-    sts = copyFrameAsync(&curRing->frame, pInputFrame, stream);
-    if (sts != RGY_ERR_NONE) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain: failed to copy input into ring: %s.\n"), get_err_mes(sts));
-        return sts;
-    }
-
-    // Build L1 (half-res Y) for this frame at arrival time; subsequent frames that reference
-    // this one as "prev" can reuse the cached L1 instead of re-downsampling per run_filter.
-    // Kernel pitch is in T-elements; NVEncC frame pitches are in bytes.
-    auto curY  = getPlane(&curRing->frame, RGY_PLANE_Y);
-    const int pitch_y0_bytes = curY.pitch[0];
-    const int pitch_y0_pixels = pitch_y0_bytes / (int)sizeof(T);
-    const int pitch_l1_pixels = m_l1Width;  // L1 is tightly packed (pitch = width)
+    const int tr = prm->smdegrain.tr;
     const int width = prm->frameOut.width;
     const int height = prm->frameOut.height;
-    T* d_cur_l1  = (T*)m_l1Buf[cur_slot]->ptr;
-    cudaError_t cerr = smdegrain::launch_downsample_2x<T>(
-        (const T*)curY.ptr[0], width, height, pitch_y0_pixels,
-        d_cur_l1, m_l1Width, m_l1Height, pitch_l1_pixels, stream);
-    if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain downsample(cur) failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+    const bool is_flush = (pInputFrame == nullptr || pInputFrame->ptr[0] == nullptr);
 
-    // UV passthrough (Phase 5i still denoises Y only).
-    auto curInputU = getPlane(pInputFrame, RGY_PLANE_U);
-    auto curInputV = getPlane(pInputFrame, RGY_PLANE_V);
-    auto outU = getPlane(ppOutputFrames[0], RGY_PLANE_U);
-    auto outV = getPlane(ppOutputFrames[0], RGY_PLANE_V);
-    sts = copyPlaneAsync(&outU, &curInputU, stream);
-    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: U passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
-    sts = copyPlaneAsync(&outV, &curInputV, stream);
-    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: V passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
-
-    auto outY = getPlane(ppOutputFrames[0], RGY_PLANE_Y);
-
-    // First frame: no prev yet, identity Y.
-    if (m_ringIdx == 0) {
-        auto curInputY = getPlane(pInputFrame, RGY_PLANE_Y);
-        sts = copyPlaneAsync(&outY, &curInputY, stream);
+    // --- Ingest phase: stash the latest input into the ring and build its L1 pyramid ---
+    if (!is_flush) {
+        const int in_slot = m_ringIdx % m_ringSize;
+        CUFrameBuf* inRing = m_ringBuf[in_slot].get();
+        sts = copyFrameAsync(&inRing->frame, pInputFrame, stream);
         if (sts != RGY_ERR_NONE) {
-            AddMessage(RGY_LOG_ERROR, _T("SMDegrain: first-frame Y copy failed: %s.\n"), get_err_mes(sts));
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain: failed to copy input into ring: %s.\n"), get_err_mes(sts));
             return sts;
         }
-        copyFramePropWithoutRes(ppOutputFrames[0], pInputFrame);
+        auto inY = getPlane(&inRing->frame, RGY_PLANE_Y);
+        const int pitch_in_pixels = inY.pitch[0] / (int)sizeof(T);
+        T* d_in_l1 = (T*)m_l1Buf[in_slot]->ptr;
+        cudaError_t cerr = smdegrain::launch_downsample_2x<T>(
+            (const T*)inY.ptr[0], width, height, pitch_in_pixels,
+            d_in_l1, m_l1Width, m_l1Height, m_l1Width, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain downsample(ingest) failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
         m_ringIdx++;
-        m_nFrameIdx++;
+    } else {
+        m_flushed = true;
+    }
+
+    // --- Emit decision ---
+    // Phase 5f causal-only mode: emit the latest received frame each input call, using
+    // up to tr past refs. Bidirectional (future refs too) was designed and the kernel
+    // supports it (NREFS up to 6) but the EOS flush plumbing produces lost tail frames —
+    // NVEncC's filter framework expects 1 output per input on this pipeline and --frames N
+    // at the decoder side doesn't trigger the null-input flush path we'd need. For now we
+    // ship causal-only; the ring/L1/MV/MC structures are already sized for 2*tr refs so
+    // bidirectional can be enabled once the flush path is worked out.
+    int emit_k = -1;
+    if (!is_flush && m_ringIdx > 0) {
+        emit_k = m_ringIdx - 1;
+    }
+    if (emit_k < 0) {
+        *pOutputFrameNum = 0;
+        ppOutputFrames[0] = nullptr;
         return RGY_ERR_NONE;
     }
 
-    // Frame N>=1: pipeline using up to `tr` causal past refs.
-    const int tr = prm->smdegrain.tr;
-    const int have_refs = std::min(m_ringIdx, tr);  // ramps during warmup
-
+    // --- Process frame emit_k ---
+    const int cur_slot = emit_k % m_ringSize;
+    CUFrameBuf* procFrame = m_ringBuf[cur_slot].get();
+    auto curY = getPlane(&procFrame->frame, RGY_PLANE_Y);
+    const int pitch_y0_bytes = curY.pitch[0];
+    const int pitch_y0_pixels = pitch_y0_bytes / (int)sizeof(T);
+    const int pitch_l1_pixels = m_l1Width;
     const T* d_cur_l0 = (const T*)curY.ptr[0];
+    T* d_cur_l1 = (T*)m_l1Buf[cur_slot]->ptr;
+
+    // UV passthrough from the FRAME BEING PROCESSED — not from the latest input.
+    // During bidirectional operation emit_k is tr frames behind m_ringIdx, and during
+    // flush pInputFrame is null, so UV must come from the ring slot.
+    auto procU = getPlane(&procFrame->frame, RGY_PLANE_U);
+    auto procV = getPlane(&procFrame->frame, RGY_PLANE_V);
+    auto outU = getPlane(ppOutputFrames[0], RGY_PLANE_U);
+    auto outV = getPlane(ppOutputFrames[0], RGY_PLANE_V);
+    sts = copyPlaneAsync(&outU, &procU, stream);
+    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: U passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
+    sts = copyPlaneAsync(&outV, &procV, stream);
+    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: V passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
+
+    auto outY = getPlane(ppOutputFrames[0], RGY_PLANE_Y);
     T* d_out = (T*)outY.ptr[0];
     const int out_pitch_bytes = outY.pitch[0];
-    smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
-    const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
-    const int l0_blocks_x = width / SMD_BLOCK_SIZE;
-
-    // For each past ref k in 1..have_refs: ME(ref, cur) -> fine_MV[k-1], MC -> mc_scratch[k-1].
-    for (int k = 1; k <= have_refs; k++) {
-        const int ref_slot = (m_ringIdx - k) % m_ringSize;
-        CUFrameBuf* refRing = m_ringBuf[ref_slot].get();
-        auto refY = getPlane(&refRing->frame, RGY_PLANE_Y);
-        const T* d_ref_l0 = (const T*)refY.ptr[0];
-        T* d_ref_l1 = (T*)m_l1Buf[ref_slot]->ptr;
-
-        smdegrain::MVBlock* d_fine_k = (smdegrain::MVBlock*)m_fineMVs[k - 1]->ptr;
-
-        cerr = smdegrain::launch_me_fullsearch<SMD_BLOCK_SIZE, T>(
-            d_ref_l1, d_cur_l1, m_l1Width, m_l1Height, pitch_l1_pixels,
-            SMD_COARSE_RADIUS, d_coarse, stream);
-        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
-
-        cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, T>(
-            d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels,
-            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_k, stream);
-        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
-
-        auto mcY = getPlane(&m_mcScratch[k - 1]->frame, RGY_PLANE_Y);
-        T* d_mc_k = (T*)mcY.ptr[0];
-        const int mc_k_pitch_bytes = mcY.pitch[0];
-        if (mc_k_pitch_bytes != pitch_y0_bytes) {
-            AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch at k=%d (mc=%d, y0=%d).\n"), k, mc_k_pitch_bytes, pitch_y0_bytes);
-            return RGY_ERR_UNSUPPORTED;
-        }
-        cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, T>(
-            d_ref_l0, d_fine_k, width, height, pitch_y0_pixels, l0_blocks_x,
-            d_mc_k, stream);
-        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain MC k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
-    }
-
     if (out_pitch_bytes != pitch_y0_bytes) {
         AddMessage(RGY_LOG_ERROR, _T("SMDegrain output pitch mismatch (y0=%d, out=%d).\n"), pitch_y0_bytes, out_pitch_bytes);
         return RGY_ERR_UNSUPPORTED;
     }
 
-    const T* mc0 = (have_refs >= 1) ? (const T*)getPlane(&m_mcScratch[0]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
-    const T* mc1 = (have_refs >= 2) ? (const T*)getPlane(&m_mcScratch[1]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
-    const T* mc2 = (have_refs >= 3) ? (const T*)getPlane(&m_mcScratch[2]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
-    const smdegrain::MVBlock* mv0 = (have_refs >= 1) ? (const smdegrain::MVBlock*)m_fineMVs[0]->ptr : nullptr;
-    const smdegrain::MVBlock* mv1 = (have_refs >= 2) ? (const smdegrain::MVBlock*)m_fineMVs[1]->ptr : nullptr;
-    const smdegrain::MVBlock* mv2 = (have_refs >= 3) ? (const smdegrain::MVBlock*)m_fineMVs[2]->ptr : nullptr;
+    // Determine how many refs we have. Refs are indexed [0, total_refs):
+    //   i < past_avail       → past frame emit_k - (i + 1)
+    //   i >= past_avail      → future frame emit_k + (i - past_avail + 1)
+    const int past_avail = std::min(emit_k, tr);
+    const int fut_avail  = std::min(m_ringIdx - 1 - emit_k, tr);
+    const int total_refs = past_avail + fut_avail;
 
-    // If contrasharp is enabled, route the blend output through degrain scratch first,
-    // then run blur + contrasharp-clamp on top to restore detail lost to temporal average.
+    ppOutputFrames[0]->picstruct = procFrame->frame.picstruct;
+
+    if (total_refs == 0) {
+        // Clip shorter than tr or otherwise no refs available — identity on Y.
+        sts = copyPlaneAsync(&outY, &curY, stream);
+        if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: identity Y copy failed: %s.\n"), get_err_mes(sts)); return sts; }
+        copyFramePropWithoutRes(ppOutputFrames[0], &procFrame->frame);
+        m_outputIdx++;
+        return RGY_ERR_NONE;
+    }
+
+    // ME + MC per ref
+    smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
+    const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
+    const int l0_blocks_x = width / SMD_BLOCK_SIZE;
+    for (int i = 0; i < total_refs; i++) {
+        int ref_frame_idx;
+        if (i < past_avail) {
+            ref_frame_idx = emit_k - (i + 1);
+        } else {
+            ref_frame_idx = emit_k + (i - past_avail + 1);
+        }
+        const int ref_slot = ref_frame_idx % m_ringSize;
+        CUFrameBuf* refRing = m_ringBuf[ref_slot].get();
+        auto refY = getPlane(&refRing->frame, RGY_PLANE_Y);
+        const T* d_ref_l0 = (const T*)refY.ptr[0];
+        T* d_ref_l1 = (T*)m_l1Buf[ref_slot]->ptr;
+
+        smdegrain::MVBlock* d_fine_i = (smdegrain::MVBlock*)m_fineMVs[i]->ptr;
+        cudaError_t cerr = smdegrain::launch_me_fullsearch<SMD_BLOCK_SIZE, T>(
+            d_ref_l1, d_cur_l1, m_l1Width, m_l1Height, pitch_l1_pixels,
+            SMD_COARSE_RADIUS, d_coarse, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, T>(
+            d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels,
+            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_i, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+
+        auto mcY = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_Y);
+        if (mcY.pitch[0] != pitch_y0_bytes) {
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch at i=%d (mc=%d, y0=%d).\n"), i, mcY.pitch[0], pitch_y0_bytes);
+            return RGY_ERR_UNSUPPORTED;
+        }
+        cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, T>(
+            d_ref_l0, d_fine_i, width, height, pitch_y0_pixels, l0_blocks_x,
+            (T*)mcY.ptr[0], stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain MC i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+    }
+
+    // Gather ref pointer arrays for the blend kernel (max 6 slots).
+    const T* mc[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+    const smdegrain::MVBlock* mv[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+    for (int i = 0; i < total_refs; i++) {
+        mc[i] = (const T*)getPlane(&m_mcScratch[i]->frame, RGY_PLANE_Y).ptr[0];
+        mv[i] = (const smdegrain::MVBlock*)m_fineMVs[i]->ptr;
+    }
+
+    // Contrasharp: blend → degrain_scratch, then blur + contrasharp → out. Off → blend → out.
     const bool contrasharp = prm->smdegrain.contrasharp;
     auto degrainY = getPlane(&m_degrainScratch->frame, RGY_PLANE_Y);
     T* d_blend_target = contrasharp ? (T*)degrainY.ptr[0] : d_out;
@@ -405,27 +445,52 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
         return RGY_ERR_UNSUPPORTED;
     }
 
-    switch (have_refs) {
+    cudaError_t cerr = cudaSuccess;
+    switch (total_refs) {
         case 1:
             cerr = smdegrain::launch_temporal_blend_nref<T, 1, SMD_BLOCK_SIZE>(
-                d_cur_l0, mc0, nullptr, nullptr, mv0, nullptr, nullptr,
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
                 l0_blocks_x, width, height, pitch_y0_pixels,
                 thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         case 2:
             cerr = smdegrain::launch_temporal_blend_nref<T, 2, SMD_BLOCK_SIZE>(
-                d_cur_l0, mc0, mc1, nullptr, mv0, mv1, nullptr,
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
                 l0_blocks_x, width, height, pitch_y0_pixels,
                 thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         case 3:
             cerr = smdegrain::launch_temporal_blend_nref<T, 3, SMD_BLOCK_SIZE>(
-                d_cur_l0, mc0, mc1, mc2, mv0, mv1, mv2,
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
+            break;
+        case 4:
+            cerr = smdegrain::launch_temporal_blend_nref<T, 4, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
+            break;
+        case 5:
+            cerr = smdegrain::launch_temporal_blend_nref<T, 5, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
+            break;
+        case 6:
+            cerr = smdegrain::launch_temporal_blend_nref<T, 6, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc[0], mc[1], mc[2], mc[3], mc[4], mc[5],
+                mv[0], mv[1], mv[2], mv[3], mv[4], mv[5],
                 l0_blocks_x, width, height, pitch_y0_pixels,
                 thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         default:
-            AddMessage(RGY_LOG_ERROR, _T("SMDegrain: unexpected have_refs=%d.\n"), have_refs);
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain: unexpected total_refs=%d.\n"), total_refs);
             return RGY_ERR_UNSUPPORTED;
     }
     if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain blend failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
@@ -440,24 +505,23 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
         cerr = smdegrain::launch_blur_3x3<T>(
             d_blend_target, width, height, pitch_y0_pixels, d_blur, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain blur failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
-
         cerr = smdegrain::launch_contrasharp<T>(
             d_blend_target, d_cur_l0, d_blur,
             width, height, pitch_y0_pixels, pix_max, d_out, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain contrasharp failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
     }
 
-    copyFramePropWithoutRes(ppOutputFrames[0], pInputFrame);
-    m_ringIdx++;
+    copyFramePropWithoutRes(ppOutputFrames[0], &procFrame->frame);
+    m_outputIdx++;
     m_nFrameIdx++;
     return RGY_ERR_NONE;
 }
 
 // Explicit instantiations — uint8_t for 8-bit YV12, uint16_t for 10/12/16-bit YV12_16.
 template RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl<uint8_t>(
-    const RGYFrameInfo*, RGYFrameInfo**, cudaStream_t, int, int, int);
+    const RGYFrameInfo*, RGYFrameInfo**, int*, cudaStream_t, int, int, int);
 template RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl<uint16_t>(
-    const RGYFrameInfo*, RGYFrameInfo**, cudaStream_t, int, int, int);
+    const RGYFrameInfo*, RGYFrameInfo**, int*, cudaStream_t, int, int, int);
 
 void NVEncFilterSMDegrain::close() {
     m_frameBuf.clear();
@@ -470,6 +534,8 @@ void NVEncFilterSMDegrain::close() {
     m_blurScratch.reset();
     m_ringSize = 0;
     m_ringIdx = 0;
+    m_outputIdx = 0;
+    m_flushed = false;
     m_l1Width = 0;
     m_l1Height = 0;
     m_cachedWidth = 0;

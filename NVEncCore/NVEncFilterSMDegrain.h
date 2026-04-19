@@ -48,16 +48,20 @@ protected:
     RGY_ERR runDenoiseImpl(
         const RGYFrameInfo *pInputFrame,
         RGYFrameInfo **ppOutputFrames,
+        int *pOutputFrameNum,
         cudaStream_t stream,
         int pix_max,
         int limit_scaled,
         int thSAD_scaled);
 
-    // Frame ring: holds 2*tr+1 recent input frames (Phase 5e MVP uses tr=1 causal only,
-    // so effectively uses 2 of them: prev and cur).
+    // Frame ring: holds 2*tr+1 recent input frames. Phase 5f uses this as a
+    // bidirectional window — at steady state we process the frame at the center
+    // of the ring so it has tr past refs AND tr future refs available.
     std::vector<std::unique_ptr<CUFrameBuf>> m_ringBuf;
     int  m_ringSize;     // cached = 2*tr+1
-    int  m_ringIdx;      // number of frames stored so far (modular into m_ringBuf)
+    int  m_ringIdx;      // number of input frames received so far
+    int  m_outputIdx;    // number of output frames emitted so far (== frame index of next emit)
+    bool m_flushed;      // true once end-of-stream flush has been started (null input seen)
 
     // L1 (half-resolution) Y-plane buffers for pyramid ME — one per ring slot.
     std::vector<std::unique_ptr<CUMemBuf>> m_l1Buf;
@@ -66,15 +70,15 @@ protected:
 
     // MV arrays.
     //   m_coarseMVs: scratch at L1 block grid, reused across refs (only the fine result matters).
-    //   m_fineMVs: one per past ref (tr slots) so the blend kernel can read each ref's SAD
-    //   for per-block thSAD gating.
+    //   m_fineMVs: one per ref (2*tr slots — bidirectional window) so the blend kernel can
+    //     read each ref's SAD for per-block thSAD gating.
     std::unique_ptr<CUMemBuf> m_coarseMVs;
     std::vector<std::unique_ptr<CUMemBuf>> m_fineMVs;
 
-    // Scratch frames — one per past ref (tr of them). Full CUFrameBuf (not bare CUMemBuf)
-    // so Y-plane pitch matches the ring-buffer frames; the blend kernel assumes identical
-    // pitches for cur / mc_ref(s) / out, which encoder-allocated frames satisfy but a
-    // contiguous cudaMalloc does not (GPU pitch alignment > width).
+    // Scratch frames — one per ref (2*tr slots in Phase 5f bidirectional mode).
+    // Full CUFrameBuf so Y-plane pitch matches the ring-buffer frames; the blend kernel
+    // assumes identical pitches for cur / mc_ref(s) / out, which encoder-allocated frames
+    // satisfy but a contiguous cudaMalloc does not (GPU pitch alignment > width).
     std::vector<std::unique_ptr<CUFrameBuf>> m_mcScratch;
 
     // Contrasharp scratch (Phase 6): post-blend pass that restores detail lost to
