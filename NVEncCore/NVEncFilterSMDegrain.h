@@ -55,11 +55,11 @@ protected:
     std::unique_ptr<CUMemBuf> m_coarseMVs;  // at L1 block grid
     std::unique_ptr<CUMemBuf> m_fineMVs;    // at L0 block grid
 
-    // Scratch frame: holds motion-compensated ref. Full CUFrameBuf (not bare CUMemBuf) so
-    // its Y-plane pitch matches the ring-buffer frames — the blend kernel assumes identical
-    // pitches for cur / mc_ref / out, which encoder-allocated frames satisfy but a
+    // Scratch frames — one per past ref (tr of them). Full CUFrameBuf (not bare CUMemBuf)
+    // so Y-plane pitch matches the ring-buffer frames; the blend kernel assumes identical
+    // pitches for cur / mc_ref(s) / out, which encoder-allocated frames satisfy but a
     // contiguous cudaMalloc does not (GPU pitch alignment > width).
-    std::unique_ptr<CUFrameBuf> m_mcScratch;
+    std::vector<std::unique_ptr<CUFrameBuf>> m_mcScratch;
 
     // Cached param snapshot for reallocation detection.
     int m_cachedWidth;

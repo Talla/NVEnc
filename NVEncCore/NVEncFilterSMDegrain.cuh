@@ -295,6 +295,57 @@ static inline cudaError_t launch_motion_compensate(
     return cudaGetLastError();
 }
 
+// N-ref bounded blend: out = cur + clamp(avg(mc_ref[0..N-1] + cur) - cur, -limit, +limit).
+// For NREFS = 1..3 causal refs. Template-specialized per N for unrolled loops.
+// Unused ref pointers (e.g. r2 when NREFS=1) may be nullptr — never dereferenced.
+template<typename T, int NREFS>
+__global__ void kernel_temporal_blend_nref(
+    const T* __restrict__ cur,
+    const T* __restrict__ r0,
+    const T* __restrict__ r1,
+    const T* __restrict__ r2,
+    const int width, const int height, const int pitch_pixels,
+    const int limit_scaled,
+    const int pix_max,
+    T* __restrict__ out
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int c = (int)cur[y * pitch_pixels + x];
+    int sum = c;
+    if constexpr (NREFS >= 1) sum += (int)r0[y * pitch_pixels + x];
+    if constexpr (NREFS >= 2) sum += (int)r1[y * pitch_pixels + x];
+    if constexpr (NREFS >= 3) sum += (int)r2[y * pitch_pixels + x];
+    const int count = NREFS + 1;
+    const int avg = (sum + count / 2) / count;    // rounded
+
+    int delta = avg - c;
+    if (delta >  limit_scaled) delta =  limit_scaled;
+    if (delta < -limit_scaled) delta = -limit_scaled;
+    int o = c + delta;
+    if (o < 0) o = 0;
+    if (o > pix_max) o = pix_max;
+    out[y * pitch_pixels + x] = (T)o;
+}
+
+template<typename T, int NREFS>
+static inline cudaError_t launch_temporal_blend_nref(
+    const T* d_cur,
+    const T* d_r0, const T* d_r1, const T* d_r2,
+    int width, int height, int pitch_pixels,
+    int limit_scaled, int pix_max,
+    T* d_out, cudaStream_t stream = 0
+) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
+    kernel_temporal_blend_nref<T, NREFS><<<grid, block, 0, stream>>>(
+        d_cur, d_r0, d_r1, d_r2, width, height, pitch_pixels,
+        limit_scaled, pix_max, d_out);
+    return cudaGetLastError();
+}
+
 // 2-frame bounded blend: out = cur + clamp((mc_ref - cur) / 2, -limit, +limit).
 // `pix_max` is the top end of the pixel range (255 for 8-bit, 1023 for 10-bit, etc.)
 // — passed as runtime int so the same kernel serves both bit depths.
