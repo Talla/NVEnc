@@ -26,6 +26,7 @@
 // --------------------------------------------------------------------------------------------
 
 #include <set>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -3009,7 +3010,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec", "sigma_curve"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3034,6 +3035,30 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                         print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
                         return 1;
                     }
+                    continue;
+                }
+                if (param_arg == _T("sigma_curve")) {
+                    // Parse dfttest-style slocation: freq/sigma;freq/sigma;...
+                    // Normalized frequencies must be strictly increasing, 0.0 <= f <= 1.0, sigma >= 0.
+                    // Note: param_val arrives with ';' intact since split() above splits only on ','.
+                    std::vector<std::pair<float, float>> curve;
+                    bool ok = true;
+                    for (const auto &pair_str : split(param_val, _T(";"))) {
+                        auto slash = pair_str.find_first_of(_T("/"));
+                        if (slash == std::string::npos) { ok = false; break; }
+                        try {
+                            float f = std::stof(pair_str.substr(0, slash));
+                            float s = std::stof(pair_str.substr(slash + 1));
+                            if (f < 0.0f || f > 1.0f || s < 0.0f) { ok = false; break; }
+                            if (!curve.empty() && f <= curve.back().first) { ok = false; break; }
+                            curve.emplace_back(f, s);
+                        } catch (...) { ok = false; break; }
+                    }
+                    if (!ok || curve.size() < 2) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    vpp->fft3d.sigma_curve = std::move(curve);
                     continue;
                 }
                 if (param_arg == _T("amount")) {
@@ -3107,6 +3132,151 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                 print_cmd_error_unknown_opt_param(option_name, param, paramList);
                 return 1;
             }
+        }
+        return 0;
+    }
+    // ------------------------------------------------------------------------
+    // --vpp-dfttest: CLI alias surfacing dfttest-native parameter names for the
+    // same engine as --vpp-fft3d. Populates the identical VppDenoiseFFT3D struct
+    // with sigma_curve set from slocation. No kernel or filter-code change.
+    // ------------------------------------------------------------------------
+    if (IS_OPTION("vpp-dfttest") && ENABLE_VPP_FILTER_FFT3D) {
+        vpp->fft3d.enable = true;
+        // Dfttest-style defaults (differ from fft3d defaults where sbsize=16 not 32).
+        vpp->fft3d.block_size = 16;
+        vpp->fft3d.overlap = 0.5f;       // sosize=8 equivalent at sbsize=16
+        vpp->fft3d.temporal = 1;         // tbsize=3 equivalent
+        vpp->fft3d.method = 0;           // ftype=0 (Wiener)
+        if (i + 1 >= nArgNum || strInput[i + 1][0] == _T('-')) {
+            // Bare --vpp-dfttest with no args is pointless (no slocation), error.
+            _ftprintf(stderr, _T("%s requires slocation=f/s;f/s;...\n"), option_name);
+            return 1;
+        }
+        i++;
+
+        // Two-pass: collect raw key=value map first, then apply conversions in
+        // dependency order (sbsize -> sosize uses sbsize).
+        std::map<tstring, tstring> kv;
+        const auto paramList = std::vector<std::string>{
+            "slocation", "sbsize", "sosize", "tbsize", "ftype", "prec", "amount"};
+        for (const auto &param : split(strInput[i], _T(","))) {
+            auto pos = param.find_first_of(_T("="));
+            if (pos == tstring::npos) {
+                print_cmd_error_unknown_opt_param(option_name, param, paramList);
+                return 1;
+            }
+            auto k = tolowercase(param.substr(0, pos));
+            auto v = param.substr(pos + 1);
+            // Warn-and-ignore for unsupported dfttest parameters (not modeled by NVEncC's fft3d).
+            if (k == _T("zmean") || k == _T("swin") || k == _T("twin") ||
+                k == _T("sbeta") || k == _T("tbeta") || k == _T("f0beta") || k == _T("smode")) {
+                _ftprintf(stderr, _T("warning: %s %s=%s not supported by NVEncC fft3d engine; ignored.\n"),
+                    option_name, k.c_str(), v.c_str());
+                continue;
+            }
+            kv[k] = v;
+        }
+
+        // sbsize → block_size
+        if (kv.count(_T("sbsize"))) {
+            int value = 0;
+            if (get_list_value(list_vpp_fft3d_block_size, kv[_T("sbsize")].c_str(), &value)) {
+                vpp->fft3d.block_size = value;
+            } else {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" sbsize="), kv[_T("sbsize")], list_vpp_fft3d_block_size);
+                return 1;
+            }
+        }
+        // sosize (pixels) → overlap fraction = sosize / sbsize
+        if (kv.count(_T("sosize"))) {
+            try {
+                int sosize = std::stoi(kv[_T("sosize")]);
+                if (sosize < 0 || sosize >= vpp->fft3d.block_size) {
+                    _ftprintf(stderr, _T("%s sosize=%d out of range (0..%d).\n"),
+                        option_name, sosize, vpp->fft3d.block_size - 1);
+                    return 1;
+                }
+                vpp->fft3d.overlap = (float)sosize / (float)vpp->fft3d.block_size;
+            } catch (...) {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" sosize="), kv[_T("sosize")]);
+                return 1;
+            }
+        }
+        // tbsize: 1=no temporal, 3=3-frame, 5=5-frame (requires Phase 8 support in kernel dispatch).
+        if (kv.count(_T("tbsize"))) {
+            try {
+                int tbsize = std::stoi(kv[_T("tbsize")]);
+                if (tbsize == 1) {
+                    vpp->fft3d.temporal = 0;
+                } else if (tbsize == 3) {
+                    vpp->fft3d.temporal = 1;
+                } else {
+                    _ftprintf(stderr, _T("%s tbsize=%d not yet supported (use 1 or 3).\n"),
+                        option_name, tbsize);
+                    return 1;
+                }
+            } catch (...) {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" tbsize="), kv[_T("tbsize")]);
+                return 1;
+            }
+        }
+        // ftype → method
+        if (kv.count(_T("ftype"))) {
+            try {
+                int ftype = std::stoi(kv[_T("ftype")]);
+                if (ftype != 0 && ftype != 1) {
+                    _ftprintf(stderr, _T("%s ftype=%d out of range (0 or 1).\n"), option_name, ftype);
+                    return 1;
+                }
+                vpp->fft3d.method = ftype;
+            } catch (...) {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" ftype="), kv[_T("ftype")]);
+                return 1;
+            }
+        }
+        // prec
+        if (kv.count(_T("prec"))) {
+            int value = 0;
+            if (get_list_value(list_vpp_fp_prec, kv[_T("prec")].c_str(), &value)) {
+                vpp->fft3d.precision = (VppFpPrecision)value;
+            } else {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" prec="), kv[_T("prec")], list_vpp_fp_prec);
+                return 1;
+            }
+        }
+        // amount (passthrough, not dfttest-native but useful for strength control)
+        if (kv.count(_T("amount"))) {
+            try {
+                vpp->fft3d.amount = std::stof(kv[_T("amount")]);
+            } catch (...) {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" amount="), kv[_T("amount")]);
+                return 1;
+            }
+        }
+        // slocation (required) → sigma_curve. Same f/s;f/s;... format.
+        if (!kv.count(_T("slocation"))) {
+            _ftprintf(stderr, _T("%s requires slocation=f/s;f/s;... (dfttest per-frequency sigma curve).\n"), option_name);
+            return 1;
+        }
+        {
+            std::vector<std::pair<float, float>> curve;
+            bool ok = true;
+            for (const auto &pair_str : split(kv[_T("slocation")], _T(";"))) {
+                auto slash = pair_str.find_first_of(_T("/"));
+                if (slash == tstring::npos) { ok = false; break; }
+                try {
+                    float f = std::stof(pair_str.substr(0, slash));
+                    float s = std::stof(pair_str.substr(slash + 1));
+                    if (f < 0.0f || f > 1.0f || s < 0.0f) { ok = false; break; }
+                    if (!curve.empty() && f <= curve.back().first) { ok = false; break; }
+                    curve.emplace_back(f, s);
+                } catch (...) { ok = false; break; }
+            }
+            if (!ok || curve.size() < 2) {
+                print_cmd_error_invalid_value(tstring(option_name) + _T(" slocation="), kv[_T("slocation")]);
+                return 1;
+            }
+            vpp->fft3d.sigma_curve = std::move(curve);
         }
         return 0;
     }

@@ -2052,6 +2052,7 @@ struct VppDenoiseFFT3D {
     int method;
     int temporal;
     VppFpPrecision precision;
+    std::vector<std::pair<float, float>> sigma_curve; // (normalized_freq, sigma) pairs; empty -> use scalar sigma. dfttest-style slocation.
     VppDenoiseFFT3D();
     bool operator==(const VppDenoiseFFT3D &x) const;
     bool operator!=(const VppDenoiseFFT3D &x) const;

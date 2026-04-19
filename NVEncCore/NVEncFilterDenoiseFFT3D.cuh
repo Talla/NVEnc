@@ -333,13 +333,14 @@ RGY_ERR denoise_fft(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame,
     return RGY_ERR_NONE;
 }
 
-template<typename TypeComplex, int temporalCurrentIdx, int temporalCount>
+template<typename TypeComplex, int BLOCK_SIZE, int temporalCurrentIdx, int temporalCount>
 __device__ complex<TypeComplex> temporal_filter(
     const complex<TypeComplex> *ptrSrcA,
     const complex<TypeComplex> *ptrSrcB,
     const complex<TypeComplex> *ptrSrcC,
     const complex<TypeComplex> *ptrSrcD,
-    const float sigma, const float limit, const int filterMethod) {
+    const float sigma, const float limit, const int filterMethod,
+    const float *sigmaTable, const int bin_x, const int bin_y) {
     static_assert(1 <= temporalCount && temporalCount <= 4, "temporalCount must be 1 to 4.");
     static_assert(0 <= temporalCurrentIdx && temporalCurrentIdx < temporalCount, "temporalCurrentIdx must be 0 to temporalCount.");
     complex<TypeComplex> work[temporalCount];
@@ -355,12 +356,17 @@ __device__ complex<TypeComplex> temporal_filter(
     #pragma unroll
     for (int z = 0; z < temporalCount; z++) {
         const float power = work[z].squaref();
+        // Per-bin sigma² LUT overrides scalar sigma when provided (dfttest slocation semantics).
+        // LUT values are pre-squared and /255-normalized host-side to match scalar-path scaling.
+        const float effectiveSigma = (sigmaTable != nullptr)
+            ? sigmaTable[z * BLOCK_SIZE * BLOCK_SIZE + bin_y * BLOCK_SIZE + bin_x]
+            : sigma;
 
         float factor;
         if (filterMethod == 0) {
-            factor = fmaxf(limit, (power - sigma) * __frcp_rn(power + 1e-15f));
+            factor = fmaxf(limit, (power - effectiveSigma) * __frcp_rn(power + 1e-15f));
         } else {
-            factor = power < sigma ? limit : 1.0f;
+            factor = power < effectiveSigma ? limit : 1.0f;
         }
         work[z] *= factor;
     }
@@ -390,7 +396,8 @@ __global__ void kernel_tfft_filter_ifft(
     const int block_count_x,
     const float *const __restrict__ ptrBlockWindowInverse,
     const int ov1, const int ov2,
-    const float sigma, const float limit, const int filterMethod
+    const float sigma, const float limit, const int filterMethod,
+    const float *const __restrict__ sigmaTable
 ) {
     static_assert(1 <= temporalCount && temporalCount <= 4, "temporalCount must be 1 to 4.");
     const int thWorker = threadIdx.x; // BLOCK_SIZE
@@ -413,12 +420,14 @@ __global__ void kernel_tfft_filter_ifft(
             const int src_x = global_bx * BLOCK_SIZE + thWorker;
             const int src_y = global_by * BLOCK_SIZE + y;
             const int src_idx = src_y * srcPitch + src_x * sizeof(complex<TypeComplex>);
-            stmp[local_bx][y][thWorker] = temporal_filter<TypeComplex, temporalCurrentIdx, temporalCount>(
+            // bin_x = thWorker, bin_y = y (each thread owns one column of the BLOCK_SIZE×BLOCK_SIZE DFT tile).
+            stmp[local_bx][y][thWorker] = temporal_filter<TypeComplex, BLOCK_SIZE, temporalCurrentIdx, temporalCount>(
                 (const complex<TypeComplex> *)(ptrSrcA + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcB + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcC + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcD + src_idx),
-                sigma, limit, filterMethod);
+                sigma, limit, filterMethod,
+                sigmaTable, thWorker, y);
         }
     }
 #else
@@ -470,7 +479,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
     const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
-    const float sigma, const float limit, const int filterMethod, cudaStream_t stream) {
+    const float sigma, const float limit, const int filterMethod,
+    const float *sigmaTable, cudaStream_t stream) {
     {
         const auto block_count = getBlockCount(widthY, heightY, BLOCK_SIZE, ov1, ov2);
         const auto planeInputYA = (pInputFrameA) ? getPlane(pInputFrameA, RGY_PLANE_Y) : RGYFrameInfo();
@@ -496,7 +506,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             block_count.first,
             ptrBlockWindowInverse,
             ov1, ov2,
-            sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod
+            sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod,
+            sigmaTable
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
@@ -532,7 +543,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             block_count.first,
             ptrBlockWindowInverse,
             ov1, ov2,
-            sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod
+            sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod,
+            sigmaTable
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
