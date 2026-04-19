@@ -79,8 +79,12 @@ RGY_ERR NVEncFilterSMDegrain::checkParam(const NVEncFilterParamSMDegrain *prm) {
         AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports 8/10/12/16-bit sources (got %d-bit).\n"), bit_depth);
         return RGY_ERR_UNSUPPORTED;
     }
-    if (RGY_CSP_CHROMA_FORMAT[prm->frameOut.csp] != RGY_CHROMAFMT_YUV420) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports YUV420 only.\n"));
+    // SMDegrain operates on Y only; U/V pass through. Accept any planar YUV chroma format
+    // (4:2:0 / 4:2:2 / 4:4:4). Allows --lossless path on 4:2:2 sources like ProRes.
+    const auto chroma = RGY_CSP_CHROMA_FORMAT[prm->frameOut.csp];
+    if (chroma != RGY_CHROMAFMT_YUV420 && chroma != RGY_CHROMAFMT_YUV422 &&
+        chroma != RGY_CHROMAFMT_YUV444) {
+        AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports planar YUV (420/422/444) only.\n"));
         return RGY_ERR_UNSUPPORTED;
     }
     if ((prm->frameOut.width & 1) || (prm->frameOut.height & 1)) {
