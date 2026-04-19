@@ -339,15 +339,17 @@ __device__ complex<TypeComplex> temporal_filter(
     const complex<TypeComplex> *ptrSrcB,
     const complex<TypeComplex> *ptrSrcC,
     const complex<TypeComplex> *ptrSrcD,
+    const complex<TypeComplex> *ptrSrcE,
     const float sigma, const float limit, const int filterMethod,
     const float *sigmaTable, const int bin_x, const int bin_y) {
-    static_assert(1 <= temporalCount && temporalCount <= 4, "temporalCount must be 1 to 4.");
+    static_assert(1 <= temporalCount && temporalCount <= 5, "temporalCount must be 1 to 5.");
     static_assert(0 <= temporalCurrentIdx && temporalCurrentIdx < temporalCount, "temporalCurrentIdx must be 0 to temporalCount.");
     complex<TypeComplex> work[temporalCount];
     work[0] = ptrSrcA[0];
     if (temporalCount >= 2) { work[1] = ptrSrcB[0]; }
     if (temporalCount >= 3) { work[2] = ptrSrcC[0]; }
     if (temporalCount >= 4) { work[3] = ptrSrcD[0]; }
+    if (temporalCount >= 5) { work[4] = ptrSrcE[0]; }
 
     if (temporalCount >= 2) {
         dft<TypeComplex, temporalCount, true, 1>(work);
@@ -392,6 +394,8 @@ __global__ void kernel_tfft_filter_ifft(
     const char *const __restrict__ ptrSrcC1,
     const char *const __restrict__ ptrSrcD0,
     const char *const __restrict__ ptrSrcD1,
+    const char *const __restrict__ ptrSrcE0,
+    const char *const __restrict__ ptrSrcE1,
     const int srcPitch,
     const int block_count_x,
     const float *const __restrict__ ptrBlockWindowInverse,
@@ -399,7 +403,7 @@ __global__ void kernel_tfft_filter_ifft(
     const float sigma, const float limit, const int filterMethod,
     const float *const __restrict__ sigmaTable
 ) {
-    static_assert(1 <= temporalCount && temporalCount <= 4, "temporalCount must be 1 to 4.");
+    static_assert(1 <= temporalCount && temporalCount <= 5, "temporalCount must be 1 to 5.");
     const int thWorker = threadIdx.x; // BLOCK_SIZE
     const int local_bx = threadIdx.y; // DENOISE_BLOCK_SIZE_X
     const int global_bx = blockIdx.x * DENOISE_BLOCK_SIZE_X + local_bx;
@@ -411,6 +415,7 @@ __global__ void kernel_tfft_filter_ifft(
     const char *const __restrict__ ptrSrcB = (temporalCount >= 2) ? selectptr2(ptrSrcB0, ptrSrcB1, plane_idx) : nullptr;
     const char *const __restrict__ ptrSrcC = (temporalCount >= 3) ? selectptr2(ptrSrcC0, ptrSrcC1, plane_idx) : nullptr;
     const char *const __restrict__ ptrSrcD = (temporalCount >= 4) ? selectptr2(ptrSrcD0, ptrSrcD1, plane_idx) : nullptr;
+    const char *const __restrict__ ptrSrcE = (temporalCount >= 5) ? selectptr2(ptrSrcE0, ptrSrcE1, plane_idx) : nullptr;
 #if 1
     __shared__ complex<TypeComplex> stmp[DENOISE_BLOCK_SIZE_X][BLOCK_SIZE][BLOCK_SIZE + 1];
 #if 1
@@ -426,6 +431,7 @@ __global__ void kernel_tfft_filter_ifft(
                 (const complex<TypeComplex> *)(ptrSrcB + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcC + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcD + src_idx),
+                (const complex<TypeComplex> *)(ptrSrcE + src_idx),
                 sigma, limit, filterMethod,
                 sigmaTable, thWorker, y);
         }
@@ -476,7 +482,7 @@ __global__ void kernel_tfft_filter_ifft(
 
 template<typename TypePixel, int bit_depth, typename TypeComplex, int BLOCK_SIZE, int DENOISE_BLOCK_SIZE_X, int temporalCurrentIdx, int temporalCount>
 RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
-    const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD,
+    const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD, const RGYFrameInfo *pInputFrameE,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
     const float sigma, const float limit, const int filterMethod,
@@ -491,6 +497,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
         const auto planeInputAC = (pInputFrameC) ? getPlane(pInputFrameC, RGY_PLANE_A) : RGYFrameInfo();
         const auto planeInputYD = (pInputFrameD) ? getPlane(pInputFrameD, RGY_PLANE_Y) : RGYFrameInfo();
         const auto planeInputAD = (pInputFrameD) ? getPlane(pInputFrameD, RGY_PLANE_A) : RGYFrameInfo();
+        const auto planeInputYE = (pInputFrameE) ? getPlane(pInputFrameE, RGY_PLANE_Y) : RGYFrameInfo();
+        const auto planeInputAE = (pInputFrameE) ? getPlane(pInputFrameE, RGY_PLANE_A) : RGYFrameInfo();
         auto planeOutputY = getPlane(pOutputFrame, RGY_PLANE_Y);
         auto planeOutputA = getPlane(pOutputFrame, RGY_PLANE_A);
         dim3 blockSize(BLOCK_SIZE, DENOISE_BLOCK_SIZE_X);
@@ -502,6 +510,7 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             (const char *)planeInputYB.ptr[0], (const char *)planeInputAB.ptr[0],
             (const char *)planeInputYC.ptr[0], (const char *)planeInputAC.ptr[0],
             (const char *)planeInputYD.ptr[0], (const char *)planeInputAD.ptr[0],
+            (const char *)planeInputYE.ptr[0], (const char *)planeInputAE.ptr[0],
             planeInputYA.pitch[0],
             block_count.first,
             ptrBlockWindowInverse,
@@ -524,6 +533,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
         const auto planeInputVC = (pInputFrameC) ? getPlane(pInputFrameC, RGY_PLANE_V) : RGYFrameInfo();
         const auto planeInputUD = (pInputFrameD) ? getPlane(pInputFrameD, RGY_PLANE_U) : RGYFrameInfo();
         const auto planeInputVD = (pInputFrameD) ? getPlane(pInputFrameD, RGY_PLANE_V) : RGYFrameInfo();
+        const auto planeInputUE = (pInputFrameE) ? getPlane(pInputFrameE, RGY_PLANE_U) : RGYFrameInfo();
+        const auto planeInputVE = (pInputFrameE) ? getPlane(pInputFrameE, RGY_PLANE_V) : RGYFrameInfo();
         auto planeOutputU = getPlane(pOutputFrame, RGY_PLANE_U);
         auto planeOutputV = getPlane(pOutputFrame, RGY_PLANE_V);
         if (planeOutputU.pitch[0] != planeOutputV.pitch[0]) {
@@ -539,6 +550,7 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             (const char *)planeInputUB.ptr[0], (const char *)planeInputVB.ptr[0],
             (const char *)planeInputUC.ptr[0], (const char *)planeInputVC.ptr[0],
             (const char *)planeInputUD.ptr[0], (const char *)planeInputVD.ptr[0],
+            (const char *)planeInputUE.ptr[0], (const char *)planeInputVE.ptr[0],
             planeInputUA.pitch[0],
             block_count.first,
             ptrBlockWindowInverse,
@@ -660,6 +672,10 @@ public:
         } else if (temporalCount == 3) {
             if (temporalCurrentIdx == 1) {
                 return denoise_tfft_filter_ifft<TypePixel, bit_depth, TypeComplex, BLOCK_SIZE, DENOISE_BLOCK_SIZE_X, 1, 3>;
+            }
+        } else if (temporalCount == 5) {
+            if (temporalCurrentIdx == 2) {
+                return denoise_tfft_filter_ifft<TypePixel, bit_depth, TypeComplex, BLOCK_SIZE, DENOISE_BLOCK_SIZE_X, 2, 5>;
             }
         }
         return nullptr;

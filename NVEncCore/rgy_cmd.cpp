@@ -3010,7 +3010,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec", "sigma_curve"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3116,6 +3116,21 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                     }
                     continue;
                 }
+                if (param_arg == _T("tbsize")) {
+                    // Explicit temporal window size. Accepts 1, 3, or 5. Overrides `temporal`.
+                    try {
+                        int tb = std::stoi(param_val);
+                        if (tb != 1 && tb != 3 && tb != 5) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->fft3d.tbsize = tb;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
                 if (param_arg == _T("prec")) {
                     int value = 0;
                     if (get_list_value(list_vpp_fp_prec, param_val.c_str(), &value)) {
@@ -3202,19 +3217,17 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                 return 1;
             }
         }
-        // tbsize: 1=no temporal, 3=3-frame, 5=5-frame (requires Phase 8 support in kernel dispatch).
+        // tbsize: 1=no temporal, 3=3-frame, 5=5-frame. Sets tbsize directly (overrides temporal).
         if (kv.count(_T("tbsize"))) {
             try {
                 int tbsize = std::stoi(kv[_T("tbsize")]);
-                if (tbsize == 1) {
-                    vpp->fft3d.temporal = 0;
-                } else if (tbsize == 3) {
-                    vpp->fft3d.temporal = 1;
-                } else {
-                    _ftprintf(stderr, _T("%s tbsize=%d not yet supported (use 1 or 3).\n"),
+                if (tbsize != 1 && tbsize != 3 && tbsize != 5) {
+                    _ftprintf(stderr, _T("%s tbsize=%d unsupported (use 1, 3, or 5).\n"),
                         option_name, tbsize);
                     return 1;
                 }
+                vpp->fft3d.tbsize = tbsize;
+                vpp->fft3d.temporal = (tbsize >= 3) ? 1 : 0;
             } catch (...) {
                 print_cmd_error_invalid_value(tstring(option_name) + _T(" tbsize="), kv[_T("tbsize")]);
                 return 1;

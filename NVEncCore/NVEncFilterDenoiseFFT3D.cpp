@@ -130,6 +130,10 @@ RGY_ERR NVEncFilterDenoiseFFT3D::checkParam(const NVEncFilterParamDenoiseFFT3D *
         AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, temporal must be 0 or 1.\n"));
         return RGY_ERR_INVALID_PARAM;
     }
+    if (prm->fft3d.tbsize != 0 && prm->fft3d.tbsize != 1 && prm->fft3d.tbsize != 3 && prm->fft3d.tbsize != 5) {
+        AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, tbsize must be 1, 3, or 5.\n"));
+        return RGY_ERR_INVALID_PARAM;
+    }
     if (get_cx_index(list_vpp_fp_prec, prm->fft3d.precision) < 0) {
         AddMessage(RGY_LOG_ERROR, _T("Invalid precision.\n"));
         return RGY_ERR_INVALID_PARAM;
@@ -156,6 +160,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         || prm->fft3d.overlap != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.overlap
         || prm->fft3d.overlap2 != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.overlap2
         || prm->fft3d.temporal != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.temporal
+        || prm->fft3d.tbsize != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.tbsize
         || prm->fft3d.precision != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.precision
         || cmpFrameInfoCspResolution(&m_param->frameOut, &prm->frameOut)) {
         m_ov1 = (int)(prm->fft3d.block_size * 0.5 * prm->fft3d.overlap + 0.5);
@@ -181,7 +186,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
             return RGY_ERR_UNSUPPORTED;
         }
 
-        if ((sts = m_bufFFT.alloc(blockGlobalWidth * complexSize, blockGlobalHeight * complexSize, fft_csp, prm->fft3d.temporal ? 3 : 1)) != RGY_ERR_NONE) {
+        if ((sts = m_bufFFT.alloc(blockGlobalWidth * complexSize, blockGlobalHeight * complexSize, fft_csp, prm->fft3d.effectiveTbsize())) != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to allocate memory for FFT: %s.\n"), get_err_mes(sts));
             return sts;
         }
@@ -236,7 +241,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
     // Only matters when curve is non-empty; otherwise the scalar-sigma path is used unchanged.
     {
         const int block_size = prm->fft3d.block_size;
-        const int temporalCount = prm->fft3d.temporal ? 3 : 1;
+        const int temporalCount = prm->fft3d.effectiveTbsize();
         const int bit_depth = RGY_CSP_BIT_DEPTH[prm->frameOut.csp];
         const auto &curve = prm->fft3d.sigma_curve;
 
@@ -313,7 +318,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
 
     setFilterInfo(pParam->print());
     m_pathThrough = FILTER_PATHTHROUGH_ALL;
-    if (prm->fft3d.temporal) {
+    if (prm->fft3d.effectiveTbsize() > 1) {
         m_pathThrough &= (~(FILTER_PATHTHROUGH_TIMESTAMP | FILTER_PATHTHROUGH_FLAGS | FILTER_PATHTHROUGH_DATA));
     }
     m_param = pParam;
@@ -345,9 +350,12 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
         return RGY_ERR_UNSUPPORTED;
     }
 
+    const int tbsize = prm->fft3d.effectiveTbsize();
+    const int lag = tbsize / 2; // 0 for tbsize=1, 1 for tbsize=3, 2 for tbsize=5
+
     const bool finalOutput = pInputFrame->ptr[0] == nullptr;
     if (finalOutput) {
-        if (!prm->fft3d.temporal || m_nFrameIdx >= m_bufIdx) {
+        if (tbsize == 1 || m_nFrameIdx >= m_bufIdx) {
             //終了
             *pOutputFrameNum = 0;
             ppOutputFrames[0] = nullptr;
@@ -381,30 +389,62 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
 
     auto planeUV = getPlane(&prm->frameOut, RGY_PLANE_U);
 
-    if (prm->fft3d.temporal) {
-        if (m_bufIdx <= 1) {
-            //出力フレームなし
+    if (tbsize > 1) {
+        // Need `lag` frames buffered before the first center emits on the streaming path.
+        if (!finalOutput && m_bufIdx <= lag) {
             *pOutputFrameNum = 0;
             ppOutputFrames[0] = nullptr;
             return sts;
         }
-        auto fftPrev = m_bufFFT.get(std::max(m_bufIdx - ((finalOutput) ? 2 : 3), 0));
-        auto fftCur  = m_bufFFT.get(m_bufIdx - ((finalOutput) ? 1 : 2));
-        auto fftNext = m_bufFFT.get(m_bufIdx - 1);
+        // Center frame index (0-based stream position). Non-final: most-recent-fft-minus-lag.
+        // Final: drain in emission order (m_nFrameIdx is the next index to emit).
+        const int centerIdx = finalOutput ? m_nFrameIdx : (m_bufIdx - 1 - lag);
+        const int lastIdx = m_bufIdx - 1;
+        // Edge frames duplicate via clamp to [0, lastIdx] — same pattern as the original tbsize=3 path.
+        const int idxPP   = std::max(centerIdx - 2, 0);
+        const int idxP    = std::max(centerIdx - 1, 0);
+        const int idxC    = centerIdx;
+        const int idxN    = std::min(centerIdx + 1, lastIdx);
+        const int idxNN   = std::min(centerIdx + 2, lastIdx);
+
         const float *sigmaTablePtr = m_sigmaTable ? (const float *)m_sigmaTable->ptr : nullptr;
-        sts = denosieFunc->tfft_filter_ifft(1, 3)(&m_filteredBlocks->frame, &fftPrev->frame, &fftCur->frame, &fftNext->frame, nullptr, (const float *)m_windowBufInverse->ptr,
-            prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
-            prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
-            sigmaTablePtr, stream);
-        if (sts != RGY_ERR_NONE) {
-            AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(1, 3): %s.\n"), get_err_mes(sts));
-            return RGY_ERR_NONE;
+        if (tbsize == 3) {
+            auto fftPrev = m_bufFFT.get(idxP);
+            auto fftCur  = m_bufFFT.get(idxC);
+            auto fftNext = m_bufFFT.get(idxN);
+            sts = denosieFunc->tfft_filter_ifft(1, 3)(&m_filteredBlocks->frame,
+                &fftPrev->frame, &fftCur->frame, &fftNext->frame, nullptr, nullptr,
+                (const float *)m_windowBufInverse->ptr,
+                prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
+                prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
+                sigmaTablePtr, stream);
+            if (sts != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(1, 3): %s.\n"), get_err_mes(sts));
+                return RGY_ERR_NONE;
+            }
+            copyFramePropWithoutRes(ppOutputFrames[0], &fftCur->frame);
+        } else { // tbsize == 5
+            auto fftPP   = m_bufFFT.get(idxPP);
+            auto fftPrev = m_bufFFT.get(idxP);
+            auto fftCur  = m_bufFFT.get(idxC);
+            auto fftNext = m_bufFFT.get(idxN);
+            auto fftNN   = m_bufFFT.get(idxNN);
+            sts = denosieFunc->tfft_filter_ifft(2, 5)(&m_filteredBlocks->frame,
+                &fftPP->frame, &fftPrev->frame, &fftCur->frame, &fftNext->frame, &fftNN->frame,
+                (const float *)m_windowBufInverse->ptr,
+                prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
+                prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
+                sigmaTablePtr, stream);
+            if (sts != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(2, 5): %s.\n"), get_err_mes(sts));
+                return RGY_ERR_NONE;
+            }
+            copyFramePropWithoutRes(ppOutputFrames[0], &fftCur->frame);
         }
-        copyFramePropWithoutRes(ppOutputFrames[0], &fftCur->frame);
     } else {
         auto fftCur = m_bufFFT.get(m_bufIdx - 1);
         const float *sigmaTablePtr = m_sigmaTable ? (const float *)m_sigmaTable->ptr : nullptr;
-        sts = denosieFunc->tfft_filter_ifft(0, 1)(&m_filteredBlocks->frame, &fftCur->frame, nullptr, nullptr, nullptr, (const float *)m_windowBufInverse->ptr,
+        sts = denosieFunc->tfft_filter_ifft(0, 1)(&m_filteredBlocks->frame, &fftCur->frame, nullptr, nullptr, nullptr, nullptr, (const float *)m_windowBufInverse->ptr,
             prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
             prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
             sigmaTablePtr, stream);

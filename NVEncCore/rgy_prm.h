@@ -2051,12 +2051,15 @@ struct VppDenoiseFFT3D {
     float overlap2;
     int method;
     int temporal;
+    int tbsize; // 0 = derive from `temporal` (legacy: 0->1, 1->3). Explicit 1/3/5 overrides.
     VppFpPrecision precision;
     std::vector<std::pair<float, float>> sigma_curve; // (normalized_freq, sigma) pairs; empty -> use scalar sigma. dfttest-style slocation.
     VppDenoiseFFT3D();
     bool operator==(const VppDenoiseFFT3D &x) const;
     bool operator!=(const VppDenoiseFFT3D &x) const;
     tstring print() const;
+    // Effective temporal window size (1, 3, or 5). Derived from tbsize/temporal.
+    int effectiveTbsize() const { return (tbsize > 0) ? tbsize : (temporal ? 3 : 1); }
 };
 
 struct VppMsmooth {

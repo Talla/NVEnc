@@ -53,7 +53,7 @@ static std::pair<int, int> getBlockCount(const int width, const int height, cons
 typedef RGY_ERR (*func_fft3d_fft)(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2,
     const float *ptrBlockWindow, cudaStream_t stream);
 typedef RGY_ERR (*func_fft3d_tfft_filter_ifft)(RGYFrameInfo *pOutputFrame,
-    const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD,
+    const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD, const RGYFrameInfo *pInputFrameE,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
     const float sigma, const float limit, const int filterMethod,
