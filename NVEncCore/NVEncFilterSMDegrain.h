@@ -51,9 +51,12 @@ protected:
     int  m_l1Width;
     int  m_l1Height;
 
-    // MV arrays — reused each run (not per-ref; we only keep the latest pair's MVs).
-    std::unique_ptr<CUMemBuf> m_coarseMVs;  // at L1 block grid
-    std::unique_ptr<CUMemBuf> m_fineMVs;    // at L0 block grid
+    // MV arrays.
+    //   m_coarseMVs: scratch at L1 block grid, reused across refs (only the fine result matters).
+    //   m_fineMVs: one per past ref (tr slots) so the blend kernel can read each ref's SAD
+    //   for per-block thSAD gating.
+    std::unique_ptr<CUMemBuf> m_coarseMVs;
+    std::vector<std::unique_ptr<CUMemBuf>> m_fineMVs;
 
     // Scratch frames — one per past ref (tr of them). Full CUFrameBuf (not bare CUMemBuf)
     // so Y-plane pitch matches the ring-buffer frames; the blend kernel assumes identical

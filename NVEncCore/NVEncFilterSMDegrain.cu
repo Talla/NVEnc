@@ -106,7 +106,7 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
     m_ringBuf.clear();
     m_l1Buf.clear();
     m_coarseMVs.reset();
-    m_fineMVs.reset();
+    m_fineMVs.clear();
     m_mcScratch.clear();
 
     m_ringBuf.resize(newRingSize);
@@ -139,14 +139,19 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
     const size_t coarse_bytes = (size_t)l1_blocks_x * l1_blocks_y * sizeof(smdegrain::MVBlock);
     const size_t fine_bytes = (size_t)l0_blocks_x * l0_blocks_y * sizeof(smdegrain::MVBlock);
     m_coarseMVs = std::unique_ptr<CUMemBuf>(new CUMemBuf(coarse_bytes));
-    m_fineMVs = std::unique_ptr<CUMemBuf>(new CUMemBuf(fine_bytes));
     if ((sts = m_coarseMVs->alloc()) != RGY_ERR_NONE) {
         AddMessage(RGY_LOG_ERROR, _T("failed to allocate coarse MV buffer: %s.\n"), get_err_mes(sts));
         return sts;
     }
-    if ((sts = m_fineMVs->alloc()) != RGY_ERR_NONE) {
-        AddMessage(RGY_LOG_ERROR, _T("failed to allocate fine MV buffer: %s.\n"), get_err_mes(sts));
-        return sts;
+    // One fine-MV buffer per past ref so thSAD gating can read each ref's per-block SAD.
+    m_fineMVs.clear();
+    m_fineMVs.resize(tr);
+    for (auto& buf : m_fineMVs) {
+        buf = std::unique_ptr<CUMemBuf>(new CUMemBuf(fine_bytes));
+        if ((sts = buf->alloc()) != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("failed to allocate fine MV buffer: %s.\n"), get_err_mes(sts));
+            return sts;
+        }
     }
 
     // One MC scratch frame per past ref (tr of them).
@@ -288,11 +293,10 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
     uint8_t* d_out = (uint8_t*)outY.ptr[0];
     const int out_pitch = outY.pitch[0];
     smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
-    smdegrain::MVBlock* d_fine   = (smdegrain::MVBlock*)m_fineMVs->ptr;
     const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
     const int l0_blocks_x = width / SMD_BLOCK_SIZE;
 
-    // For each past ref k in 1..have_refs: ME(ref, cur) + MC(ref) → m_mcScratch[k-1].
+    // For each past ref k in 1..have_refs: ME(ref, cur) -> fine_MV[k-1], MC -> mc_scratch[k-1].
     for (int k = 1; k <= have_refs; k++) {
         const int ref_slot = (m_ringIdx - k) % m_ringSize;
         CUFrameBuf* refRing = m_ringBuf[ref_slot].get();
@@ -300,19 +304,18 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
         const uint8_t* d_ref_l0 = (const uint8_t*)refY.ptr[0];
         uint8_t* d_ref_l1 = (uint8_t*)m_l1Buf[ref_slot]->ptr;
 
-        // Coarse ME at L1 (both L1s already built on frame arrival).
+        smdegrain::MVBlock* d_fine_k = (smdegrain::MVBlock*)m_fineMVs[k - 1]->ptr;
+
         cerr = smdegrain::launch_me_fullsearch<SMD_BLOCK_SIZE, uint8_t>(
             d_ref_l1, d_cur_l1, m_l1Width, m_l1Height, pitch_l1,
             SMD_COARSE_RADIUS, d_coarse, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
 
-        // Refine at L0.
         cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, uint8_t>(
             d_ref_l0, d_cur_l0, width, height, pitch_y0,
-            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine, stream);
+            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_k, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
 
-        // MC this ref into mc scratch slot k-1.
         auto mcY = getPlane(&m_mcScratch[k - 1]->frame, RGY_PLANE_Y);
         uint8_t* d_mc_k = (uint8_t*)mcY.ptr[0];
         const int mc_k_pitch = mcY.pitch[0];
@@ -321,7 +324,7 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
             return RGY_ERR_UNSUPPORTED;
         }
         cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, uint8_t>(
-            d_ref_l0, d_fine, width, height, pitch_y0, l0_blocks_x,
+            d_ref_l0, d_fine_k, width, height, pitch_y0, l0_blocks_x,
             d_mc_k, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain MC k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
     }
@@ -331,28 +334,34 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
         return RGY_ERR_UNSUPPORTED;
     }
 
-    // Dispatch N-ref blend (runtime N via template specialization).
     const int limit_scaled = prm->smdegrain.limit;
+    const int thSAD       = prm->smdegrain.thSAD;
     const int pix_max = 255;
     const uint8_t* mc0 = (have_refs >= 1) ? (const uint8_t*)getPlane(&m_mcScratch[0]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
     const uint8_t* mc1 = (have_refs >= 2) ? (const uint8_t*)getPlane(&m_mcScratch[1]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
     const uint8_t* mc2 = (have_refs >= 3) ? (const uint8_t*)getPlane(&m_mcScratch[2]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
+    const smdegrain::MVBlock* mv0 = (have_refs >= 1) ? (const smdegrain::MVBlock*)m_fineMVs[0]->ptr : nullptr;
+    const smdegrain::MVBlock* mv1 = (have_refs >= 2) ? (const smdegrain::MVBlock*)m_fineMVs[1]->ptr : nullptr;
+    const smdegrain::MVBlock* mv2 = (have_refs >= 3) ? (const smdegrain::MVBlock*)m_fineMVs[2]->ptr : nullptr;
 
     switch (have_refs) {
         case 1:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 1>(
-                d_cur_l0, mc0, nullptr, nullptr, width, height, pitch_y0,
-                limit_scaled, pix_max, d_out, stream);
+            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 1, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc0, nullptr, nullptr, mv0, nullptr, nullptr,
+                l0_blocks_x, width, height, pitch_y0,
+                thSAD, limit_scaled, pix_max, d_out, stream);
             break;
         case 2:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 2>(
-                d_cur_l0, mc0, mc1, nullptr, width, height, pitch_y0,
-                limit_scaled, pix_max, d_out, stream);
+            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 2, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc0, mc1, nullptr, mv0, mv1, nullptr,
+                l0_blocks_x, width, height, pitch_y0,
+                thSAD, limit_scaled, pix_max, d_out, stream);
             break;
         case 3:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 3>(
-                d_cur_l0, mc0, mc1, mc2, width, height, pitch_y0,
-                limit_scaled, pix_max, d_out, stream);
+            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 3, SMD_BLOCK_SIZE>(
+                d_cur_l0, mc0, mc1, mc2, mv0, mv1, mv2,
+                l0_blocks_x, width, height, pitch_y0,
+                thSAD, limit_scaled, pix_max, d_out, stream);
             break;
         default:
             AddMessage(RGY_LOG_ERROR, _T("SMDegrain: unexpected have_refs=%d.\n"), have_refs);
@@ -371,7 +380,7 @@ void NVEncFilterSMDegrain::close() {
     m_ringBuf.clear();
     m_l1Buf.clear();
     m_coarseMVs.reset();
-    m_fineMVs.reset();
+    m_fineMVs.clear();
     m_mcScratch.clear();
     m_ringSize = 0;
     m_ringIdx = 0;

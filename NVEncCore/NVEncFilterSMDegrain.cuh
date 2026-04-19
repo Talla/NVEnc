@@ -298,13 +298,23 @@ static inline cudaError_t launch_motion_compensate(
 // N-ref bounded blend: out = cur + clamp(avg(mc_ref[0..N-1] + cur) - cur, -limit, +limit).
 // For NREFS = 1..3 causal refs. Template-specialized per N for unrolled loops.
 // Unused ref pointers (e.g. r2 when NREFS=1) may be nullptr — never dereferenced.
-template<typename T, int NREFS>
+// N-ref blend with per-block thSAD gating: refs whose block SAD exceeds thSAD are
+// excluded from the average for that block (per-pixel, since SAD is looked up per block).
+// This is the mechanism that differentiates media_processor's heavy_cs (thSAD=500) from
+// medium_cs (thSAD=300) — higher thSAD accepts more refs → more denoising in fast-motion
+// regions where ME is less reliable.
+template<typename T, int NREFS, int BLOCK_SIZE>
 __global__ void kernel_temporal_blend_nref(
     const T* __restrict__ cur,
     const T* __restrict__ r0,
     const T* __restrict__ r1,
     const T* __restrict__ r2,
+    const MVBlock* __restrict__ mv0,
+    const MVBlock* __restrict__ mv1,
+    const MVBlock* __restrict__ mv2,
+    const int mv_blocks_x,
     const int width, const int height, const int pitch_pixels,
+    const int thSAD,
     const int limit_scaled,
     const int pix_max,
     T* __restrict__ out
@@ -313,13 +323,23 @@ __global__ void kernel_temporal_blend_nref(
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
+    const int bx = x / BLOCK_SIZE;
+    const int by = y / BLOCK_SIZE;
+    const int block_idx = by * mv_blocks_x + bx;
+
     const int c = (int)cur[y * pitch_pixels + x];
     int sum = c;
-    if constexpr (NREFS >= 1) sum += (int)r0[y * pitch_pixels + x];
-    if constexpr (NREFS >= 2) sum += (int)r1[y * pitch_pixels + x];
-    if constexpr (NREFS >= 3) sum += (int)r2[y * pitch_pixels + x];
-    const int count = NREFS + 1;
-    const int avg = (sum + count / 2) / count;    // rounded
+    int count = 1;
+    if constexpr (NREFS >= 1) {
+        if (mv0[block_idx].sad <= thSAD) { sum += (int)r0[y * pitch_pixels + x]; count++; }
+    }
+    if constexpr (NREFS >= 2) {
+        if (mv1[block_idx].sad <= thSAD) { sum += (int)r1[y * pitch_pixels + x]; count++; }
+    }
+    if constexpr (NREFS >= 3) {
+        if (mv2[block_idx].sad <= thSAD) { sum += (int)r2[y * pitch_pixels + x]; count++; }
+    }
+    const int avg = (sum + count / 2) / count;
 
     int delta = avg - c;
     if (delta >  limit_scaled) delta =  limit_scaled;
@@ -330,19 +350,21 @@ __global__ void kernel_temporal_blend_nref(
     out[y * pitch_pixels + x] = (T)o;
 }
 
-template<typename T, int NREFS>
+template<typename T, int NREFS, int BLOCK_SIZE>
 static inline cudaError_t launch_temporal_blend_nref(
     const T* d_cur,
     const T* d_r0, const T* d_r1, const T* d_r2,
+    const MVBlock* d_mv0, const MVBlock* d_mv1, const MVBlock* d_mv2,
+    int mv_blocks_x,
     int width, int height, int pitch_pixels,
-    int limit_scaled, int pix_max,
+    int thSAD, int limit_scaled, int pix_max,
     T* d_out, cudaStream_t stream = 0
 ) {
     const dim3 block(16, 16, 1);
     const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
-    kernel_temporal_blend_nref<T, NREFS><<<grid, block, 0, stream>>>(
-        d_cur, d_r0, d_r1, d_r2, width, height, pitch_pixels,
-        limit_scaled, pix_max, d_out);
+    kernel_temporal_blend_nref<T, NREFS, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+        d_cur, d_r0, d_r1, d_r2, d_mv0, d_mv1, d_mv2, mv_blocks_x,
+        width, height, pitch_pixels, thSAD, limit_scaled, pix_max, d_out);
     return cudaGetLastError();
 }
 
