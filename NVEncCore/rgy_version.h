@@ -105,7 +105,7 @@ const char *get_encoder_version();
 #define ENABLE_NVML 1
 #define ENABLE_NVRTC 1
 #define ENABLE_VMAF 1
-#define ENABLE_LIBVSHIP 1
+#define ENABLE_LIBVSHIP 0
 #define ENABLE_NVVFX 1
 #define ENABLE_NVOFFRUC 1
 #define ENABLE_NVSDKNGX 1
@@ -133,8 +133,8 @@ const char *get_encoder_version();
 #define FOR_AUO                   0
 #define ENABLE_RAW_READER         1
 #define ENABLE_AVI_READER         1
-#define ENABLE_AVISYNTH_READER    1
-#define ENABLE_VAPOURSYNTH_READER 1
+#define ENABLE_AVISYNTH_READER    0
+#define ENABLE_VAPOURSYNTH_READER 0
 #define ENABLE_AVSW_READER        1
 #define ENABLE_SM_READER          1
 #define ENABLE_LIBAVDEVICE        1
