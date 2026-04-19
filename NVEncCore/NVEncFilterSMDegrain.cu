@@ -40,6 +40,8 @@ NVEncFilterSMDegrain::NVEncFilterSMDegrain() :
     m_coarseMVs(),
     m_fineMVs(),
     m_mcScratch(),
+    m_degrainScratch(),
+    m_blurScratch(),
     m_cachedWidth(0),
     m_cachedHeight(0),
     m_cachedTr(0),
@@ -113,6 +115,8 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
     m_coarseMVs.reset();
     m_fineMVs.clear();
     m_mcScratch.clear();
+    m_degrainScratch.reset();
+    m_blurScratch.reset();
 
     m_ringBuf.resize(newRingSize);
     for (auto& buf : m_ringBuf) {
@@ -171,6 +175,21 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
             AddMessage(RGY_LOG_ERROR, _T("failed to allocate MC scratch frame: %s.\n"), get_err_mes(sts));
             return sts;
         }
+    }
+
+    // Contrasharp scratches (Phase 6). Always allocate — the path is skipped at runtime
+    // when contrasharp is off, but the buffers are trivial and realloc would just churn.
+    m_degrainScratch = std::unique_ptr<CUFrameBuf>(new CUFrameBuf());
+    sts = m_degrainScratch->alloc(width, height, prm->frameOut.csp);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("failed to allocate degrain scratch frame: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+    m_blurScratch = std::unique_ptr<CUFrameBuf>(new CUFrameBuf());
+    sts = m_blurScratch->alloc(width, height, prm->frameOut.csp);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("failed to allocate blur scratch frame: %s.\n"), get_err_mes(sts));
+        return sts;
     }
 
     m_ringSize = newRingSize;
@@ -375,30 +394,58 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     const smdegrain::MVBlock* mv1 = (have_refs >= 2) ? (const smdegrain::MVBlock*)m_fineMVs[1]->ptr : nullptr;
     const smdegrain::MVBlock* mv2 = (have_refs >= 3) ? (const smdegrain::MVBlock*)m_fineMVs[2]->ptr : nullptr;
 
+    // If contrasharp is enabled, route the blend output through degrain scratch first,
+    // then run blur + contrasharp-clamp on top to restore detail lost to temporal average.
+    const bool contrasharp = prm->smdegrain.contrasharp;
+    auto degrainY = getPlane(&m_degrainScratch->frame, RGY_PLANE_Y);
+    T* d_blend_target = contrasharp ? (T*)degrainY.ptr[0] : d_out;
+    const int blend_pitch_bytes = contrasharp ? degrainY.pitch[0] : out_pitch_bytes;
+    if (blend_pitch_bytes != pitch_y0_bytes) {
+        AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch for blend target (y0=%d, target=%d).\n"), pitch_y0_bytes, blend_pitch_bytes);
+        return RGY_ERR_UNSUPPORTED;
+    }
+
     switch (have_refs) {
         case 1:
             cerr = smdegrain::launch_temporal_blend_nref<T, 1, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, nullptr, nullptr, mv0, nullptr, nullptr,
                 l0_blocks_x, width, height, pitch_y0_pixels,
-                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         case 2:
             cerr = smdegrain::launch_temporal_blend_nref<T, 2, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, mc1, nullptr, mv0, mv1, nullptr,
                 l0_blocks_x, width, height, pitch_y0_pixels,
-                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         case 3:
             cerr = smdegrain::launch_temporal_blend_nref<T, 3, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, mc1, mc2, mv0, mv1, mv2,
                 l0_blocks_x, width, height, pitch_y0_pixels,
-                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
+                thSAD_scaled, limit_scaled, pix_max, d_blend_target, stream);
             break;
         default:
             AddMessage(RGY_LOG_ERROR, _T("SMDegrain: unexpected have_refs=%d.\n"), have_refs);
             return RGY_ERR_UNSUPPORTED;
     }
     if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain blend failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+
+    if (contrasharp) {
+        auto blurY = getPlane(&m_blurScratch->frame, RGY_PLANE_Y);
+        T* d_blur = (T*)blurY.ptr[0];
+        if (blurY.pitch[0] != pitch_y0_bytes) {
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain blur pitch mismatch (y0=%d, blur=%d).\n"), pitch_y0_bytes, blurY.pitch[0]);
+            return RGY_ERR_UNSUPPORTED;
+        }
+        cerr = smdegrain::launch_blur_3x3<T>(
+            d_blend_target, width, height, pitch_y0_pixels, d_blur, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain blur failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+
+        cerr = smdegrain::launch_contrasharp<T>(
+            d_blend_target, d_cur_l0, d_blur,
+            width, height, pitch_y0_pixels, pix_max, d_out, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain contrasharp failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+    }
 
     copyFramePropWithoutRes(ppOutputFrames[0], pInputFrame);
     m_ringIdx++;
@@ -419,6 +466,8 @@ void NVEncFilterSMDegrain::close() {
     m_coarseMVs.reset();
     m_fineMVs.clear();
     m_mcScratch.clear();
+    m_degrainScratch.reset();
+    m_blurScratch.reset();
     m_ringSize = 0;
     m_ringIdx = 0;
     m_l1Width = 0;

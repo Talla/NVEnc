@@ -411,4 +411,101 @@ static inline cudaError_t launch_temporal_blend_2frame(
     return cudaGetLastError();
 }
 
+// ------------------------------------------------------------------------------------------
+// Contrasharp post-pass (Phase 6)
+//
+// MVTools' SMDegrain contrasharp is a "repair-clamped unsharp mask": take the degrained
+// frame, compute its own high-frequency detail (frame - blur(frame)), add it back to
+// recover lost sharpness, then clamp the result between [min(degrain,source), max(degrain,source)]
+// so the sharpened pixel can't exceed what was already present in the noisy source. That
+// prevents amplifying noise — you only get back detail that both exists in the source and
+// survived the temporal blend.
+//
+// Two kernels:
+//   kernel_blur_3x3<T>    — separable 3x3 box (cheap; the exact blur shape barely matters
+//                           for a one-tap unsharp restore since the source-clamp dominates)
+//   kernel_contrasharp<T> — out = clamp(degrain + (degrain - blurred), min(d,s), max(d,s))
+// ------------------------------------------------------------------------------------------
+
+template<typename T>
+__global__ void kernel_blur_3x3(
+    const T* __restrict__ src,
+    const int width, const int height, const int pitch_pixels,
+    T* __restrict__ dst
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int xm = (x > 0)           ? x - 1 : x;
+    const int xp = (x < width  - 1)  ? x + 1 : x;
+    const int ym = (y > 0)           ? y - 1 : y;
+    const int yp = (y < height - 1)  ? y + 1 : y;
+
+    int sum = 0;
+    sum += (int)src[ym * pitch_pixels + xm];
+    sum += (int)src[ym * pitch_pixels + x ];
+    sum += (int)src[ym * pitch_pixels + xp];
+    sum += (int)src[y  * pitch_pixels + xm];
+    sum += (int)src[y  * pitch_pixels + x ];
+    sum += (int)src[y  * pitch_pixels + xp];
+    sum += (int)src[yp * pitch_pixels + xm];
+    sum += (int)src[yp * pitch_pixels + x ];
+    sum += (int)src[yp * pitch_pixels + xp];
+    dst[y * pitch_pixels + x] = (T)((sum + 4) / 9);  // rounded mean
+}
+
+template<typename T>
+static inline cudaError_t launch_blur_3x3(
+    const T* d_src, int width, int height, int pitch_pixels,
+    T* d_dst, cudaStream_t stream = 0
+) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
+    kernel_blur_3x3<T><<<grid, block, 0, stream>>>(d_src, width, height, pitch_pixels, d_dst);
+    return cudaGetLastError();
+}
+
+template<typename T>
+__global__ void kernel_contrasharp(
+    const T* __restrict__ degrain,
+    const T* __restrict__ source,
+    const T* __restrict__ blurred_degrain,
+    const int width, const int height, const int pitch_pixels,
+    const int pix_max,
+    T* __restrict__ out
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int d = (int)degrain[y * pitch_pixels + x];
+    const int s = (int)source [y * pitch_pixels + x];
+    const int b = (int)blurred_degrain[y * pitch_pixels + x];
+    // Unsharp-mask tentative: d + (d - b) = 2d - b
+    int t = 2 * d - b;
+    // Repair-clamp between degrain and source — MVTools' safety net so contrasharp can't
+    // drag a pixel past the original noisy value (preventing noise amplification).
+    const int lo = d < s ? d : s;
+    const int hi = d > s ? d : s;
+    if (t < lo) t = lo;
+    if (t > hi) t = hi;
+    if (t < 0) t = 0;
+    if (t > pix_max) t = pix_max;
+    out[y * pitch_pixels + x] = (T)t;
+}
+
+template<typename T>
+static inline cudaError_t launch_contrasharp(
+    const T* d_degrain, const T* d_source, const T* d_blurred,
+    int width, int height, int pitch_pixels, int pix_max,
+    T* d_out, cudaStream_t stream = 0
+) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
+    kernel_contrasharp<T><<<grid, block, 0, stream>>>(
+        d_degrain, d_source, d_blurred, width, height, pitch_pixels, pix_max, d_out);
+    return cudaGetLastError();
+}
+
 } // namespace smdegrain

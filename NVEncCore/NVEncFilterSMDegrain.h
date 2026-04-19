@@ -77,6 +77,12 @@ protected:
     // contiguous cudaMalloc does not (GPU pitch alignment > width).
     std::vector<std::unique_ptr<CUFrameBuf>> m_mcScratch;
 
+    // Contrasharp scratch (Phase 6): post-blend pass that restores detail lost to
+    // temporal averaging. m_degrainScratch holds the blend output before sharpening;
+    // m_blurScratch holds the 3x3-blurred version used as the unsharp reference.
+    std::unique_ptr<CUFrameBuf> m_degrainScratch;
+    std::unique_ptr<CUFrameBuf> m_blurScratch;
+
     // Cached param snapshot for reallocation detection.
     int m_cachedWidth;
     int m_cachedHeight;
