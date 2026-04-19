@@ -72,14 +72,15 @@ RGY_ERR NVEncFilterSMDegrain::checkParam(const NVEncFilterParamSMDegrain *prm) {
         AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, limit must be 0..255 (got %d).\n"), prm->smdegrain.limit);
         return RGY_ERR_INVALID_PARAM;
     }
-    // Phase 5e MVP: only 8-bit YV12 (NV12→YV12 is performed by an earlier cspconv filter).
-    if (RGY_CSP_BIT_DEPTH[prm->frameOut.csp] != 8) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain MVP supports 8-bit sources only (phase 5e). got %d-bit.\n"),
-            RGY_CSP_BIT_DEPTH[prm->frameOut.csp]);
+    // Phase 5i: accept 8/10/12/16-bit YUV420 (NV12/P010 → YV12/YV12_16 performed by earlier cspconv).
+    // Kernels are templated on T (uint8_t / uint16_t); pix_max and limit are scaled by bit_depth.
+    const int bit_depth = RGY_CSP_BIT_DEPTH[prm->frameOut.csp];
+    if (bit_depth != 8 && bit_depth != 10 && bit_depth != 12 && bit_depth != 16) {
+        AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports 8/10/12/16-bit sources (got %d-bit).\n"), bit_depth);
         return RGY_ERR_UNSUPPORTED;
     }
     if (RGY_CSP_CHROMA_FORMAT[prm->frameOut.csp] != RGY_CHROMAFMT_YUV420) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain MVP supports YV12/YUV420 only (phase 5e).\n"));
+        AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports YUV420 only.\n"));
         return RGY_ERR_UNSUPPORTED;
     }
     if ((prm->frameOut.width & 1) || (prm->frameOut.height & 1)) {
@@ -121,7 +122,9 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
 
     m_l1Width = width / 2;
     m_l1Height = height / 2;
-    const size_t l1_bytes = (size_t)m_l1Width * m_l1Height;
+    // L1 raw buffer holds T elements (uint8 or uint16) — size must scale by bit depth.
+    const int bytes_per_pixel = (RGY_CSP_BIT_DEPTH[prm->frameOut.csp] > 8) ? 2 : 1;
+    const size_t l1_bytes = (size_t)m_l1Width * m_l1Height * bytes_per_pixel;
     m_l1Buf.resize(newRingSize);
     for (auto& buf : m_l1Buf) {
         buf = std::unique_ptr<CUMemBuf>(new CUMemBuf(l1_bytes));
@@ -210,8 +213,6 @@ RGY_ERR NVEncFilterSMDegrain::init(shared_ptr<NVEncFilterParam> pParam, shared_p
 
 RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames,
                                          int *pOutputFrameNum, cudaStream_t stream) {
-    RGY_ERR sts = RGY_ERR_NONE;
-
     *pOutputFrameNum = 1;
     if (ppOutputFrames[0] == nullptr) {
         auto pOutFrame = m_frameBuf[0].get();
@@ -237,6 +238,33 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
         return RGY_ERR_INVALID_PARAM;
     }
 
+    // Compute bit-depth-derived scaling constants once and dispatch to the templated impl.
+    // limit and thSAD are specified in 8-bit scale per media_processor convention and scaled
+    // to the internal bit depth here. Both scale linearly with pixel magnitude:
+    //   limit: 8-bit delta cap → bit_depth delta cap (255 → 1020 for 10-bit).
+    //   thSAD: sum-of-abs-differences over an 8x8 block — grows linearly with pixel range
+    //          (a uniform 10-bit frame pair has SADs 4x larger than the 8-bit equivalent),
+    //          so scale by the same factor to keep rejection behavior identical across
+    //          bit depths (thSAD=300 → 1200 for 10-bit content).
+    const int bit_depth = RGY_CSP_BIT_DEPTH[prm->frameOut.csp];
+    const int pix_max = (1 << bit_depth) - 1;
+    const int limit_scaled = prm->smdegrain.limit << (bit_depth - 8);
+    const int thSAD_scaled = prm->smdegrain.thSAD << (bit_depth - 8);
+
+    if (bit_depth == 8) {
+        return runDenoiseImpl<uint8_t>(pInputFrame, ppOutputFrames, stream, pix_max, limit_scaled, thSAD_scaled);
+    }
+    return runDenoiseImpl<uint16_t>(pInputFrame, ppOutputFrames, stream, pix_max, limit_scaled, thSAD_scaled);
+}
+
+template<typename T>
+RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
+    const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames,
+    cudaStream_t stream, int pix_max, int limit_scaled, int thSAD_scaled
+) {
+    RGY_ERR sts = RGY_ERR_NONE;
+    auto prm = std::dynamic_pointer_cast<NVEncFilterParamSMDegrain>(m_param);
+
     // Stash the full current frame into the ring.
     const int cur_slot = m_ringIdx % m_ringSize;
     CUFrameBuf* curRing = m_ringBuf[cur_slot].get();
@@ -248,18 +276,20 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
 
     // Build L1 (half-res Y) for this frame at arrival time; subsequent frames that reference
     // this one as "prev" can reuse the cached L1 instead of re-downsampling per run_filter.
+    // Kernel pitch is in T-elements; NVEncC frame pitches are in bytes.
     auto curY  = getPlane(&curRing->frame, RGY_PLANE_Y);
-    const int pitch_y0 = curY.pitch[0];
-    const int pitch_l1 = m_l1Width;
+    const int pitch_y0_bytes = curY.pitch[0];
+    const int pitch_y0_pixels = pitch_y0_bytes / (int)sizeof(T);
+    const int pitch_l1_pixels = m_l1Width;  // L1 is tightly packed (pitch = width)
     const int width = prm->frameOut.width;
     const int height = prm->frameOut.height;
-    uint8_t* d_cur_l1  = (uint8_t*)m_l1Buf[cur_slot]->ptr;
-    cudaError_t cerr = smdegrain::launch_downsample_2x<uint8_t>(
-        (const uint8_t*)curY.ptr[0], width, height, pitch_y0,
-        d_cur_l1, m_l1Width, m_l1Height, pitch_l1, stream);
+    T* d_cur_l1  = (T*)m_l1Buf[cur_slot]->ptr;
+    cudaError_t cerr = smdegrain::launch_downsample_2x<T>(
+        (const T*)curY.ptr[0], width, height, pitch_y0_pixels,
+        d_cur_l1, m_l1Width, m_l1Height, pitch_l1_pixels, stream);
     if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain downsample(cur) failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
 
-    // UV passthrough (Phase 5g still denoises Y only).
+    // UV passthrough (Phase 5i still denoises Y only).
     auto curInputU = getPlane(pInputFrame, RGY_PLANE_U);
     auto curInputV = getPlane(pInputFrame, RGY_PLANE_V);
     auto outU = getPlane(ppOutputFrames[0], RGY_PLANE_U);
@@ -289,9 +319,9 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
     const int tr = prm->smdegrain.tr;
     const int have_refs = std::min(m_ringIdx, tr);  // ramps during warmup
 
-    const uint8_t* d_cur_l0 = (const uint8_t*)curY.ptr[0];
-    uint8_t* d_out = (uint8_t*)outY.ptr[0];
-    const int out_pitch = outY.pitch[0];
+    const T* d_cur_l0 = (const T*)curY.ptr[0];
+    T* d_out = (T*)outY.ptr[0];
+    const int out_pitch_bytes = outY.pitch[0];
     smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
     const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
     const int l0_blocks_x = width / SMD_BLOCK_SIZE;
@@ -301,67 +331,64 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
         const int ref_slot = (m_ringIdx - k) % m_ringSize;
         CUFrameBuf* refRing = m_ringBuf[ref_slot].get();
         auto refY = getPlane(&refRing->frame, RGY_PLANE_Y);
-        const uint8_t* d_ref_l0 = (const uint8_t*)refY.ptr[0];
-        uint8_t* d_ref_l1 = (uint8_t*)m_l1Buf[ref_slot]->ptr;
+        const T* d_ref_l0 = (const T*)refY.ptr[0];
+        T* d_ref_l1 = (T*)m_l1Buf[ref_slot]->ptr;
 
         smdegrain::MVBlock* d_fine_k = (smdegrain::MVBlock*)m_fineMVs[k - 1]->ptr;
 
-        cerr = smdegrain::launch_me_fullsearch<SMD_BLOCK_SIZE, uint8_t>(
-            d_ref_l1, d_cur_l1, m_l1Width, m_l1Height, pitch_l1,
+        cerr = smdegrain::launch_me_fullsearch<SMD_BLOCK_SIZE, T>(
+            d_ref_l1, d_cur_l1, m_l1Width, m_l1Height, pitch_l1_pixels,
             SMD_COARSE_RADIUS, d_coarse, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
 
-        cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, uint8_t>(
-            d_ref_l0, d_cur_l0, width, height, pitch_y0,
+        cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, T>(
+            d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels,
             SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_k, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
 
         auto mcY = getPlane(&m_mcScratch[k - 1]->frame, RGY_PLANE_Y);
-        uint8_t* d_mc_k = (uint8_t*)mcY.ptr[0];
-        const int mc_k_pitch = mcY.pitch[0];
-        if (mc_k_pitch != pitch_y0) {
-            AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch at k=%d (mc=%d, y0=%d).\n"), k, mc_k_pitch, pitch_y0);
+        T* d_mc_k = (T*)mcY.ptr[0];
+        const int mc_k_pitch_bytes = mcY.pitch[0];
+        if (mc_k_pitch_bytes != pitch_y0_bytes) {
+            AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch at k=%d (mc=%d, y0=%d).\n"), k, mc_k_pitch_bytes, pitch_y0_bytes);
             return RGY_ERR_UNSUPPORTED;
         }
-        cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, uint8_t>(
-            d_ref_l0, d_fine_k, width, height, pitch_y0, l0_blocks_x,
+        cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, T>(
+            d_ref_l0, d_fine_k, width, height, pitch_y0_pixels, l0_blocks_x,
             d_mc_k, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain MC k=%d failed: %d.\n"), k, (int)cerr); return RGY_ERR_CUDA; }
     }
 
-    if (out_pitch != pitch_y0) {
-        AddMessage(RGY_LOG_ERROR, _T("SMDegrain output pitch mismatch (y0=%d, out=%d).\n"), pitch_y0, out_pitch);
+    if (out_pitch_bytes != pitch_y0_bytes) {
+        AddMessage(RGY_LOG_ERROR, _T("SMDegrain output pitch mismatch (y0=%d, out=%d).\n"), pitch_y0_bytes, out_pitch_bytes);
         return RGY_ERR_UNSUPPORTED;
     }
 
-    const int limit_scaled = prm->smdegrain.limit;
-    const int thSAD       = prm->smdegrain.thSAD;
-    const int pix_max = 255;
-    const uint8_t* mc0 = (have_refs >= 1) ? (const uint8_t*)getPlane(&m_mcScratch[0]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
-    const uint8_t* mc1 = (have_refs >= 2) ? (const uint8_t*)getPlane(&m_mcScratch[1]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
-    const uint8_t* mc2 = (have_refs >= 3) ? (const uint8_t*)getPlane(&m_mcScratch[2]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
+    const T* mc0 = (have_refs >= 1) ? (const T*)getPlane(&m_mcScratch[0]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
+    const T* mc1 = (have_refs >= 2) ? (const T*)getPlane(&m_mcScratch[1]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
+    const T* mc2 = (have_refs >= 3) ? (const T*)getPlane(&m_mcScratch[2]->frame, RGY_PLANE_Y).ptr[0] : nullptr;
     const smdegrain::MVBlock* mv0 = (have_refs >= 1) ? (const smdegrain::MVBlock*)m_fineMVs[0]->ptr : nullptr;
     const smdegrain::MVBlock* mv1 = (have_refs >= 2) ? (const smdegrain::MVBlock*)m_fineMVs[1]->ptr : nullptr;
     const smdegrain::MVBlock* mv2 = (have_refs >= 3) ? (const smdegrain::MVBlock*)m_fineMVs[2]->ptr : nullptr;
 
     switch (have_refs) {
         case 1:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 1, SMD_BLOCK_SIZE>(
+            cerr = smdegrain::launch_temporal_blend_nref<T, 1, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, nullptr, nullptr, mv0, nullptr, nullptr,
-                l0_blocks_x, width, height, pitch_y0,
-                thSAD, limit_scaled, pix_max, d_out, stream);
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
             break;
         case 2:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 2, SMD_BLOCK_SIZE>(
+            cerr = smdegrain::launch_temporal_blend_nref<T, 2, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, mc1, nullptr, mv0, mv1, nullptr,
-                l0_blocks_x, width, height, pitch_y0,
-                thSAD, limit_scaled, pix_max, d_out, stream);
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
             break;
         case 3:
-            cerr = smdegrain::launch_temporal_blend_nref<uint8_t, 3, SMD_BLOCK_SIZE>(
+            cerr = smdegrain::launch_temporal_blend_nref<T, 3, SMD_BLOCK_SIZE>(
                 d_cur_l0, mc0, mc1, mc2, mv0, mv1, mv2,
-                l0_blocks_x, width, height, pitch_y0,
-                thSAD, limit_scaled, pix_max, d_out, stream);
+                l0_blocks_x, width, height, pitch_y0_pixels,
+                thSAD_scaled, limit_scaled, pix_max, d_out, stream);
             break;
         default:
             AddMessage(RGY_LOG_ERROR, _T("SMDegrain: unexpected have_refs=%d.\n"), have_refs);
@@ -374,6 +401,12 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
     m_nFrameIdx++;
     return RGY_ERR_NONE;
 }
+
+// Explicit instantiations — uint8_t for 8-bit YV12, uint16_t for 10/12/16-bit YV12_16.
+template RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl<uint8_t>(
+    const RGYFrameInfo*, RGYFrameInfo**, cudaStream_t, int, int, int);
+template RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl<uint16_t>(
+    const RGYFrameInfo*, RGYFrameInfo**, cudaStream_t, int, int, int);
 
 void NVEncFilterSMDegrain::close() {
     m_frameBuf.clear();

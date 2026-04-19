@@ -40,6 +40,19 @@ protected:
     RGY_ERR checkParam(const NVEncFilterParamSMDegrain *prm);
     RGY_ERR allocateWorkspaces(const NVEncFilterParamSMDegrain *prm);
 
+    // Templated pipeline body. Instantiated for uint8_t (8-bit) and uint16_t (10/12/16-bit).
+    // Handles ring store, L1 downsample, UV passthrough, first-frame identity, and the
+    // full ME+MC+blend pipeline for frame N>=1. Called from run_filter() after a bit-depth
+    // dispatch. `pix_max` and `limit_scaled` are computed by the caller from bit_depth.
+    template<typename T>
+    RGY_ERR runDenoiseImpl(
+        const RGYFrameInfo *pInputFrame,
+        RGYFrameInfo **ppOutputFrames,
+        cudaStream_t stream,
+        int pix_max,
+        int limit_scaled,
+        int thSAD_scaled);
+
     // Frame ring: holds 2*tr+1 recent input frames (Phase 5e MVP uses tr=1 causal only,
     // so effectively uses 2 of them: prev and cur).
     std::vector<std::unique_ptr<CUFrameBuf>> m_ringBuf;
