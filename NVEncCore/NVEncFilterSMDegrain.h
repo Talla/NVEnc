@@ -1,7 +1,7 @@
 // -----------------------------------------------------------------------------------------
 // NVEnc by rigaya (SMDegrain port, MIT)
 // -----------------------------------------------------------------------------------------
-// nvenc-smdegrain port — Phase 3 filter skeleton with ring buffer + identity passthrough.
+// nvenc-smdegrain port — Phase 5 filter class.
 // Clean-room reimplementation of the SMDegrain function (havsfunc / MVTools). Name retained
 // for discoverability; algorithm and implementation are new code, no GPL source copied.
 // -----------------------------------------------------------------------------------------
@@ -11,6 +11,7 @@
 #include "NVEncFilter.h"
 #include "rgy_prm.h"
 #include <array>
+#include <vector>
 
 #if (defined(WIN32) || defined(WIN64)) && defined(_M_IX86)
 #define ENABLE_VPP_SMDEGRAIN 0
@@ -37,9 +38,32 @@ protected:
     virtual RGY_ERR run_filter(const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames, int *pOutputFrameNum, cudaStream_t stream) override;
     virtual void close() override;
     RGY_ERR checkParam(const NVEncFilterParamSMDegrain *prm);
+    RGY_ERR allocateWorkspaces(const NVEncFilterParamSMDegrain *prm);
 
-    // Motion-estimation reference-frame ring: 2*tr+1 frames. Phase 3 allocates but
-    // does not yet index into it; Phase 4+ will store refs here for block-matching ME.
+    // Frame ring: holds 2*tr+1 recent input frames (Phase 5e MVP uses tr=1 causal only,
+    // so effectively uses 2 of them: prev and cur).
     std::vector<std::unique_ptr<CUFrameBuf>> m_ringBuf;
-    int m_ringSize;
+    int  m_ringSize;     // cached = 2*tr+1
+    int  m_ringIdx;      // number of frames stored so far (modular into m_ringBuf)
+
+    // L1 (half-resolution) Y-plane buffers for pyramid ME — one per ring slot.
+    std::vector<std::unique_ptr<CUMemBuf>> m_l1Buf;
+    int  m_l1Width;
+    int  m_l1Height;
+
+    // MV arrays — reused each run (not per-ref; we only keep the latest pair's MVs).
+    std::unique_ptr<CUMemBuf> m_coarseMVs;  // at L1 block grid
+    std::unique_ptr<CUMemBuf> m_fineMVs;    // at L0 block grid
+
+    // Scratch frame: holds motion-compensated ref. Full CUFrameBuf (not bare CUMemBuf) so
+    // its Y-plane pitch matches the ring-buffer frames — the blend kernel assumes identical
+    // pitches for cur / mc_ref / out, which encoder-allocated frames satisfy but a
+    // contiguous cudaMalloc does not (GPU pitch alignment > width).
+    std::unique_ptr<CUFrameBuf> m_mcScratch;
+
+    // Cached param snapshot for reallocation detection.
+    int m_cachedWidth;
+    int m_cachedHeight;
+    int m_cachedTr;
+    RGY_CSP m_cachedCsp;
 };
