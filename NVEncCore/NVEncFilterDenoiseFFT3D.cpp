@@ -79,7 +79,12 @@ NVEncFilterDenoiseFFT3D::NVEncFilterDenoiseFFT3D() :
     m_bufFFT(),
     m_filteredBlocks(),
     m_windowBuf(),
-    m_windowBufInverse() {
+    m_windowBufInverse(),
+    m_sigmaTable(),
+    m_sigmaTableCurve(),
+    m_sigmaTableBlockSize(0),
+    m_sigmaTableTemporalCount(0),
+    m_sigmaTableBitDepth(0) {
     m_name = _T("denoise-fft");
 }
 
@@ -227,6 +232,85 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         }
     }
 
+    // Build per-bin sigma² LUT from sigma_curve (dfttest slocation semantics).
+    // Only matters when curve is non-empty; otherwise the scalar-sigma path is used unchanged.
+    {
+        const int block_size = prm->fft3d.block_size;
+        const int temporalCount = prm->fft3d.temporal ? 3 : 1;
+        const int bit_depth = RGY_CSP_BIT_DEPTH[prm->frameOut.csp];
+        const auto &curve = prm->fft3d.sigma_curve;
+
+        const bool paramsChanged =
+            block_size != m_sigmaTableBlockSize ||
+            temporalCount != m_sigmaTableTemporalCount ||
+            bit_depth != m_sigmaTableBitDepth ||
+            curve != m_sigmaTableCurve;
+
+        if (paramsChanged) {
+            if (curve.empty()) {
+                m_sigmaTable.reset();
+            } else {
+                const size_t lutCount = (size_t)temporalCount * block_size * block_size;
+                std::vector<float> lut(lutCount);
+                // Match the scalar path's host-side sigma normalization at .cuh:499 — divide by (1<<8)-1 = 255.
+                // Upstream uses 8 here regardless of bit_depth; mirror it so a flat curve produces scalar-equivalent output.
+                const float scaleInv = 1.0f / 255.0f;
+                for (int bz = 0; bz < temporalCount; bz++) {
+                    const float fz = (temporalCount > 1)
+                        ? (float)std::min(bz, temporalCount - bz) / ((float)temporalCount * 0.5f)
+                        : 0.0f;
+                    for (int by = 0; by < block_size; by++) {
+                        const float fy = (float)std::min(by, block_size - by) / ((float)block_size * 0.5f);
+                        for (int bx = 0; bx < block_size; bx++) {
+                            const float fx = (float)std::min(bx, block_size - bx) / ((float)block_size * 0.5f);
+                            float radial = std::sqrt((fx * fx + fy * fy) * 0.5f + fz * fz);
+                            if (radial > 1.0f) radial = 1.0f;
+                            // Piecewise-linear interpolation of (freq, sigma) pairs sorted ascending on freq.
+                            float sigma_bin;
+                            if (radial <= curve.front().first) {
+                                sigma_bin = curve.front().second;
+                            } else if (radial >= curve.back().first) {
+                                sigma_bin = curve.back().second;
+                            } else {
+                                sigma_bin = curve.back().second;
+                                for (size_t i = 1; i < curve.size(); i++) {
+                                    if (radial <= curve[i].first) {
+                                        const float f0 = curve[i - 1].first;
+                                        const float f1 = curve[i].first;
+                                        const float s0 = curve[i - 1].second;
+                                        const float s1 = curve[i].second;
+                                        const float t = (radial - f0) / (f1 - f0);
+                                        sigma_bin = s0 + t * (s1 - s0);
+                                        break;
+                                    }
+                                }
+                            }
+                            // Store sigma² so a flat curve sigma=S matches scalar sigma=S² after the shared /255 scaling.
+                            lut[(size_t)bz * block_size * block_size + (size_t)by * block_size + bx] =
+                                sigma_bin * sigma_bin * scaleInv;
+                        }
+                    }
+                }
+
+                m_sigmaTable = std::unique_ptr<CUMemBuf>(new CUMemBuf(lutCount * sizeof(float)));
+                if ((sts = m_sigmaTable->alloc()) != RGY_ERR_NONE) {
+                    AddMessage(RGY_LOG_ERROR, _T("failed to allocate memory for sigma_curve LUT: %s.\n"), get_err_mes(sts));
+                    return sts;
+                }
+                if ((sts = err_to_rgy(cudaMemcpy(m_sigmaTable->ptr, lut.data(), lutCount * sizeof(float), cudaMemcpyHostToDevice))) != RGY_ERR_NONE) {
+                    AddMessage(RGY_LOG_ERROR, _T("failed to copy memory for sigma_curve LUT: %s.\n"), get_err_mes(sts));
+                    return sts;
+                }
+                AddMessage(RGY_LOG_DEBUG, _T("Built sigma_curve LUT: %d x %d x %d (%zu floats)\n"),
+                    temporalCount, block_size, block_size, lutCount);
+            }
+            m_sigmaTableCurve = curve;
+            m_sigmaTableBlockSize = block_size;
+            m_sigmaTableTemporalCount = temporalCount;
+            m_sigmaTableBitDepth = bit_depth;
+        }
+    }
+
     setFilterInfo(pParam->print());
     m_pathThrough = FILTER_PATHTHROUGH_ALL;
     if (prm->fft3d.temporal) {
@@ -307,9 +391,11 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
         auto fftPrev = m_bufFFT.get(std::max(m_bufIdx - ((finalOutput) ? 2 : 3), 0));
         auto fftCur  = m_bufFFT.get(m_bufIdx - ((finalOutput) ? 1 : 2));
         auto fftNext = m_bufFFT.get(m_bufIdx - 1);
+        const float *sigmaTablePtr = m_sigmaTable ? (const float *)m_sigmaTable->ptr : nullptr;
         sts = denosieFunc->tfft_filter_ifft(1, 3)(&m_filteredBlocks->frame, &fftPrev->frame, &fftCur->frame, &fftNext->frame, nullptr, (const float *)m_windowBufInverse->ptr,
             prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
-            prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method, stream);
+            prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
+            sigmaTablePtr, stream);
         if (sts != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(1, 3): %s.\n"), get_err_mes(sts));
             return RGY_ERR_NONE;
@@ -317,9 +403,11 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
         copyFramePropWithoutRes(ppOutputFrames[0], &fftCur->frame);
     } else {
         auto fftCur = m_bufFFT.get(m_bufIdx - 1);
+        const float *sigmaTablePtr = m_sigmaTable ? (const float *)m_sigmaTable->ptr : nullptr;
         sts = denosieFunc->tfft_filter_ifft(0, 1)(&m_filteredBlocks->frame, &fftCur->frame, nullptr, nullptr, nullptr, (const float *)m_windowBufInverse->ptr,
             prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
-            prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method, stream);
+            prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
+            sigmaTablePtr, stream);
         if (sts != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(0, 1): %s.\n"), get_err_mes(sts));
             return RGY_ERR_NONE;
@@ -340,4 +428,9 @@ void NVEncFilterDenoiseFFT3D::close() {
     m_bufFFT.clear();
     m_windowBuf.reset();
     m_windowBufInverse.reset();
+    m_sigmaTable.reset();
+    m_sigmaTableCurve.clear();
+    m_sigmaTableBlockSize = 0;
+    m_sigmaTableTemporalCount = 0;
+    m_sigmaTableBitDepth = 0;
 }

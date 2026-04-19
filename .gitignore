@@ -182,3 +182,8 @@ $RECYCLE.BIN/
 
 # Mac desktop service store files
 .DS_Store
+
+# nvenc-smdegrain fork local artifacts (not for upstream)
+/_validation/
+/build.stdout
+/ffmpeg_lgpl.7z

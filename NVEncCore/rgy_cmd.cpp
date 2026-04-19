@@ -3009,7 +3009,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec", "sigma_curve"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3034,6 +3034,30 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                         print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
                         return 1;
                     }
+                    continue;
+                }
+                if (param_arg == _T("sigma_curve")) {
+                    // Parse dfttest-style slocation: freq/sigma;freq/sigma;...
+                    // Normalized frequencies must be strictly increasing, 0.0 <= f <= 1.0, sigma >= 0.
+                    // Note: param_val arrives with ';' intact since split() above splits only on ','.
+                    std::vector<std::pair<float, float>> curve;
+                    bool ok = true;
+                    for (const auto &pair_str : split(param_val, _T(";"))) {
+                        auto slash = pair_str.find_first_of(_T("/"));
+                        if (slash == std::string::npos) { ok = false; break; }
+                        try {
+                            float f = std::stof(pair_str.substr(0, slash));
+                            float s = std::stof(pair_str.substr(slash + 1));
+                            if (f < 0.0f || f > 1.0f || s < 0.0f) { ok = false; break; }
+                            if (!curve.empty() && f <= curve.back().first) { ok = false; break; }
+                            curve.emplace_back(f, s);
+                        } catch (...) { ok = false; break; }
+                    }
+                    if (!ok || curve.size() < 2) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    vpp->fft3d.sigma_curve = std::move(curve);
                     continue;
                 }
                 if (param_arg == _T("amount")) {
@@ -3097,6 +3121,106 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                         vpp->fft3d.precision = (VppFpPrecision)value;
                     } else {
                         print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val, list_vpp_fp_prec);
+                        return 1;
+                    }
+                    continue;
+                }
+                print_cmd_error_unknown_opt_param(option_name, param_arg, paramList);
+                return 1;
+            } else {
+                print_cmd_error_unknown_opt_param(option_name, param, paramList);
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (IS_OPTION("vpp-smdegrain") && ENABLE_VPP_FILTER_SMDEGRAIN) {
+        // SMDegrain motion-compensated temporal denoise (nvenc-smdegrain port, Phase 2: parser only).
+        // Clean-room reimplementation of the SMDegrain function from havsfunc/MVTools.
+        vpp->smdegrain.enable = true;
+        if (i + 1 >= nArgNum || strInput[i + 1][0] == _T('-')) {
+            return 0;
+        }
+        i++;
+        const auto paramList = std::vector<std::string>{
+            "tr", "thsad", "limit", "contrasharp", "thscd1", "search"};
+        for (const auto &param : split(strInput[i], _T(","))) {
+            auto pos = param.find_first_of(_T("="));
+            if (pos != std::string::npos) {
+                auto param_arg = param.substr(0, pos);
+                auto param_val = param.substr(pos + 1);
+                param_arg = tolowercase(param_arg);
+                if (param_arg == _T("enable")) {
+                    bool b = false;
+                    if (cmd_string_to_bool(&b, param_val) == 0) {
+                        vpp->smdegrain.enable = b;
+                    } else {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("tr")) {
+                    try {
+                        const int v = std::stoi(param_val);
+                        if (v < 1 || v > 3) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->smdegrain.tr = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("thsad")) {
+                    try {
+                        vpp->smdegrain.thSAD = std::stoi(param_val);
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("limit")) {
+                    try {
+                        const int v = std::stoi(param_val);
+                        if (v < 0 || v > 255) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->smdegrain.limit = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("contrasharp")) {
+                    bool b = false;
+                    if (cmd_string_to_bool(&b, param_val) == 0) {
+                        vpp->smdegrain.contrasharp = b;
+                    } else {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("thscd1")) {
+                    try {
+                        vpp->smdegrain.thSCD1 = std::stoi(param_val);
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("search")) {
+                    try {
+                        vpp->smdegrain.search = std::stoi(param_val);
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
                         return 1;
                     }
                     continue;

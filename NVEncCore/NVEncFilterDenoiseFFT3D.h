@@ -56,7 +56,8 @@ typedef RGY_ERR (*func_fft3d_tfft_filter_ifft)(RGYFrameInfo *pOutputFrame,
     const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
-    const float sigma, const float limit, const int filterMethod, cudaStream_t stream);
+    const float sigma, const float limit, const int filterMethod,
+    const float *sigmaTable, cudaStream_t stream);
 typedef RGY_ERR (*func_fft3d_merge)(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2, cudaStream_t stream);
 
 class DenoiseFFT3DBase {
@@ -98,4 +99,13 @@ protected:
     std::unique_ptr<CUFrameBuf> m_filteredBlocks;
     std::unique_ptr<CUMemBuf> m_windowBuf;
     std::unique_ptr<CUMemBuf> m_windowBufInverse;
+    // Per-bin sigma² LUT for dfttest-style slocation curves.
+    // Layout: temporalCount × BLOCK_SIZE × BLOCK_SIZE (row-major: [z][y][x]).
+    // Null when sigma_curve is empty (scalar-sigma path unchanged).
+    std::unique_ptr<CUMemBuf> m_sigmaTable;
+    // Cached inputs used to build m_sigmaTable — lets us skip rebuild if unchanged.
+    std::vector<std::pair<float, float>> m_sigmaTableCurve;
+    int m_sigmaTableBlockSize;
+    int m_sigmaTableTemporalCount;
+    int m_sigmaTableBitDepth;
 };
