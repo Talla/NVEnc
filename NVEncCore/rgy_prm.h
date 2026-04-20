@@ -68,6 +68,7 @@ static const int RGY_AUDIO_QUALITY_DEFAULT = 0;
 #define ENABLE_VPP_FILTER_DENOISE_DCT  (ENCODER_QSV   || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP || CLFILTERS_AUF)
 #define ENABLE_VPP_FILTER_SMOOTH       (ENCODER_QSV   || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP || CLFILTERS_AUF)
 #define ENABLE_VPP_FILTER_FFT3D        (ENCODER_QSV   || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP)
+#define ENABLE_VPP_FILTER_SMDEGRAIN    (ENCODER_NVENC)
 #define ENABLE_VPP_FILTER_MSMOOTH      (ENCODER_QSV   || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP || CLFILTERS_AUF)
 #define ENABLE_VPP_FILTER_CONVOLUTION3D (ENCODER_QSV  || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP)
 #define ENABLE_VPP_FILTER_UNSHARP      (ENCODER_QSV   || ENCODER_NVENC || ENCODER_VCEENC || ENCODER_MPP || CLFILTERS_AUF)
@@ -162,6 +163,7 @@ enum class VppType : int {
     CL_DENOISE_DCT,
     CL_DENOISE_SMOOTH,
     CL_DENOISE_FFT3D,
+    CL_SMDEGRAIN,
     CL_MSMOOTH,
 
     CL_LIBPLACEBO_SHADER,
@@ -384,6 +386,16 @@ static const float FILTER_DEFAULT_DENOISE_FFT3D_OVERLAP  = 0.5;
 static const float FILTER_DEFAULT_DENOISE_FFT3D_OVERLAP2 = 0.0;
 static const int   FILTER_DEFAULT_DENOISE_FFT3D_METHOD = 0;
 static const int   FILTER_DEFAULT_DENOISE_FFT3D_TEMPORAL = 1;
+
+// SMDegrain motion-compensated temporal denoise (nvenc-smdegrain port).
+// Clean-room reimplementation of the SMDegrain function from havsfunc/MVTools.
+// Defaults match media_processor's "medium_cs" preset (safe middle ground).
+static const int   FILTER_DEFAULT_SMDEGRAIN_TR          = 2;    // temporal radius 1..3
+static const int   FILTER_DEFAULT_SMDEGRAIN_THSAD       = 300;  // block SAD threshold above which refs are rejected
+static const int   FILTER_DEFAULT_SMDEGRAIN_LIMIT       = 160;  // max per-pixel correction (0..255)
+static const bool  FILTER_DEFAULT_SMDEGRAIN_CONTRASHARP = true; // restore micro-detail after temporal average
+static const int   FILTER_DEFAULT_SMDEGRAIN_THSCD1      = 9999; // scene-change SAD threshold (9999 ~= disabled, matches all media_processor presets)
+static const int   FILTER_DEFAULT_SMDEGRAIN_SEARCH      = 3;    // search mode (MVTools-style; 3 = exhaustive log-diamond)
 
 static const int   FILTER_DEFAULT_MSMOOTH_STRENGTH = 3;
 static const float FILTER_DEFAULT_MSMOOTH_THRESHOLD = 15.0f;
@@ -2058,6 +2070,21 @@ struct VppDenoiseFFT3D {
     tstring print() const;
 };
 
+struct VppSMDegrain {
+    bool enable;
+    int  tr;           // temporal radius (1..3); ring buffer size = 2*tr+1
+    int  thSAD;        // block SAD cut-off for rejecting a ref block
+    int  limit;        // max per-pixel delta after bounded average (0..255)
+    bool contrasharp;  // run contra-sharp pass after averaging
+    int  thSCD1;       // scene-change SAD threshold (currently a stub; all media_processor presets set ~9999)
+    int  search;       // search mode (MVTools-style; all media_processor presets use 3)
+
+    VppSMDegrain();
+    bool operator==(const VppSMDegrain &x) const;
+    bool operator!=(const VppSMDegrain &x) const;
+    tstring print() const;
+};
+
 struct VppMsmooth {
     bool  enable;
     int   strength;
@@ -2343,6 +2370,7 @@ struct RGYParamVpp {
     VppDenoiseDct dct;
     VppSmooth smooth;
     VppDenoiseFFT3D fft3d;
+    VppSMDegrain smdegrain;
     VppMsmooth msmooth;
     std::vector<VppSubburn> subburn;
     std::vector<VppLibplaceboShader> libplacebo_shader;

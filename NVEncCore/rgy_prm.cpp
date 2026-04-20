@@ -96,6 +96,7 @@ static const auto VPPTYPE_TO_STR = make_array<std::pair<VppType, tstring>>(
     std::make_pair(VppType::CL_DENOISE_DCT,          _T("denoise-dct")),
     std::make_pair(VppType::CL_DENOISE_SMOOTH,       _T("smooth")),
     std::make_pair(VppType::CL_DENOISE_FFT3D,        _T("fft3d")),
+    std::make_pair(VppType::CL_SMDEGRAIN,            _T("smdegrain")),
     std::make_pair(VppType::CL_MSMOOTH,              _T("msmooth")),
     std::make_pair(VppType::CL_SUBBURN,              _T("subburn")),
     std::make_pair(VppType::CL_LIBPLACEBO_SHADER,    _T("libplacebo-shader")),
@@ -1528,10 +1529,38 @@ bool VppDenoiseFFT3D::operator!=(const VppDenoiseFFT3D &x) const {
 }
 
 tstring VppDenoiseFFT3D::print() const {
-    tstring str = strsprintf(_T("denoise-fft3d: sigma %.2f, strength %.2f, block_size %d\n"
+    return strsprintf(_T("denoise-fft3d: sigma %.2f, strength %.2f, block_size %d\n"
         "                         overlap %.2f, method %d, temporal %d, precision %s"),
         sigma, amount, block_size, overlap, method, temporal, get_cx_desc(list_vpp_fp_prec, precision));
-    return str;
+}
+
+VppSMDegrain::VppSMDegrain() :
+    enable(false),
+    tr(FILTER_DEFAULT_SMDEGRAIN_TR),
+    thSAD(FILTER_DEFAULT_SMDEGRAIN_THSAD),
+    limit(FILTER_DEFAULT_SMDEGRAIN_LIMIT),
+    contrasharp(FILTER_DEFAULT_SMDEGRAIN_CONTRASHARP),
+    thSCD1(FILTER_DEFAULT_SMDEGRAIN_THSCD1),
+    search(FILTER_DEFAULT_SMDEGRAIN_SEARCH) {
+
+}
+
+bool VppSMDegrain::operator==(const VppSMDegrain &x) const {
+    return enable == x.enable
+        && tr == x.tr
+        && thSAD == x.thSAD
+        && limit == x.limit
+        && contrasharp == x.contrasharp
+        && thSCD1 == x.thSCD1
+        && search == x.search;
+}
+bool VppSMDegrain::operator!=(const VppSMDegrain &x) const {
+    return !(*this == x);
+}
+
+tstring VppSMDegrain::print() const {
+    return strsprintf(_T("smdegrain: tr %d, thSAD %d, limit %d, contrasharp %s, thSCD1 %d, search %d"),
+        tr, thSAD, limit, contrasharp ? _T("on") : _T("off"), thSCD1, search);
 }
 
 VppMsmooth::VppMsmooth() :
@@ -2123,6 +2152,7 @@ RGYParamVpp::RGYParamVpp() :
     dct(),
     smooth(),
     fft3d(),
+    smdegrain(),
     msmooth(),
     subburn(),
     libplacebo_shader(),
@@ -2163,6 +2193,7 @@ bool RGYParamVpp::operator==(const RGYParamVpp& x) const {
         && dct == x.dct
         && smooth == x.smooth
         && fft3d == x.fft3d
+        && smdegrain == x.smdegrain
         && msmooth == x.msmooth
         && subburn == x.subburn
         && unsharp == x.unsharp

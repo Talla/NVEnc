@@ -258,15 +258,8 @@
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -310,15 +303,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -362,15 +348,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -413,15 +392,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -465,15 +437,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -517,15 +482,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -575,15 +533,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -627,15 +578,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelStatic|Win32'">
@@ -681,15 +625,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNVDLL|Win32'">
@@ -735,15 +672,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelStatic|x64'">
@@ -789,15 +719,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNVDLL|x64'">
@@ -843,15 +766,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     </CudaCompile>
     <CudaLink />
     <PreBuildEvent>
-      <Command>@set REV=0
-where git &gt;NUL　2&gt;&amp;1
-for /f %%i in ('powershell "foreach($p in (get-wmiobject win32_process -filter processid=$pid)){$ppid=$p.parentprocessid;}foreach($p in (get-wmiobject win32_process -filter processid=$ppid)){$p.parentprocessid;}"') do set PID=%%i
-if %errorlevel% == 0 for /f "usebackq tokens=*" %%A in (`git rev-list HEAD ^| find /c /v ""`) do @set REV=%%A
-echo #pragma once &gt; rgy_rev.h.%PID%.tmp
-echo #define ENCODER_REV "%REV%" &gt;&gt; rgy_rev.h.%PID%.tmp
-fc rgy_rev.h.%PID%.tmp rgy_rev.h &gt; nul 2&gt;&amp;1
-if not %errorlevel% == 0 move /y rgy_rev.h.%PID%.tmp rgy_rev.h  &gt; nul 2&gt;&amp;1
-if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Command>
+      <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
+@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -1414,6 +1330,12 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
     </CudaCompile>
+    <CudaCompile Include="NVEncFilterSMDegrain.cu">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+    </CudaCompile>
     <CudaCompile Include="NVEncFilterDenoiseFFT3D8FP16.cu">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
@@ -1571,6 +1493,8 @@ if exist rgy_rev.h.%PID%.tmp del rgy_rev.h.%PID%.tmp &gt; nul 2&gt;&amp;1</Comma
     <ClInclude Include="NVEncFilterDenoiseDct.h" />
     <ClInclude Include="NVEncFilterDenoiseFFT3D.cuh" />
     <ClInclude Include="NVEncFilterDenoiseFFT3D.h" />
+    <ClInclude Include="NVEncFilterSMDegrain.h" />
+    <ClInclude Include="NVEncFilterSMDegrain.cuh" />
     <ClInclude Include="NVEncFilterDenoiseNLMeans.h" />
     <ClInclude Include="NVEncFilterD3D11.h" />
     <ClInclude Include="NVEncFilterLibplacebo.h" />
