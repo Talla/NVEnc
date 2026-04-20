@@ -17,11 +17,11 @@ import sys
 from pathlib import Path
 
 
-NVENCC          = r"D:/python_playground/NVEnc-smdegrain/_build/x64/RelStatic/NVEncC64.exe"
+NVENCC          = r"D:/python_playground/NVEnc-combined/_build/x64/RelStatic/NVEncC64.exe"
 VSPIPE          = shutil.which("vspipe") or r"C:/Users/Eduard/AppData/Local/Programs/VapourSynth/core/vspipe.exe"
 FFMPEG          = shutil.which("ffmpeg") or "ffmpeg"
 PROFILES_DIR    = Path(r"D:/python_playground/media_processor/media_processor/config/noise_profiles")
-OUT_DIR         = Path(r"D:/python_playground/NVEnc-smdegrain/_validation/hybrid_comparison")
+OUT_DIR         = Path(r"D:/python_playground/NVEnc-combined/_validation/hybrid_comparison")
 
 # Tier params mirroring media_processor/config/denoise.py
 DFTTEST_HEAVY_SIGMA_SCALE = 2.5

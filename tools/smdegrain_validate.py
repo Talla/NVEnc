@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 
 
-NVENCC = r"D:/python_playground/NVEnc-smdegrain/_build/x64/RelStatic/NVEncC64.exe"
+NVENCC = r"D:/python_playground/NVEnc-combined/_build/x64/RelStatic/NVEncC64.exe"
 VSPIPE = shutil.which("vspipe") or r"C:/Users/Eduard/AppData/Local/Programs/VapourSynth/core/vspipe.exe"
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
