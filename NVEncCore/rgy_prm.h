@@ -2645,6 +2645,7 @@ struct RGYParamCommon {
     bool offsetVideoDtsAdvance;
     bool allowOtherNegativePts;
     bool disableMp4Opt;
+    bool metadataCopyRich; //通常は削除/通常tag化されるQuickTime系metadata keyを保持する
     bool debugDirectAV1Out;
     bool debugRawOut;
     tstring outReplayFile;

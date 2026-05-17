@@ -6460,6 +6460,10 @@ int parse_one_common_option(const TCHAR *option_name, const TCHAR *strInput[], i
         }
         return 0;
     }
+    if (IS_OPTION("metadata-copy-rich")) {
+        common->metadataCopyRich = true;
+        return 0;
+    }
     if (IS_OPTION("no-mp4opt")) {
         common->disableMp4Opt = true;
         return 0;
@@ -8956,6 +8960,7 @@ tstring gen_cmd(const RGYParamCommon *param, const RGYParamCommon *defaultPrm, b
     OPT_STR_PATH(_T("--keyfile"), keyFile);
 
     OPT_BOOL(_T("--no-mp4opt"), _T(""), disableMp4Opt);
+    OPT_BOOL(_T("--metadata-copy-rich"), _T(""), metadataCopyRich);
     OPT_LST(_T("--avsync"), AVSyncMode, list_avsync);
     OPT_BOOL(_T("--timestamp-passthrough"), _T(""), timestampPassThrough);
     OPT_BOOL(_T("--muxer-add-cmd"), _T(""), muxerAddCmd);
@@ -9487,6 +9492,7 @@ tstring gen_cmd_help_common() {
         _T("   --metadata <string>          set metadata for output file.\n")
         _T("                                 - copy ... copy metadata from input (default)\n")
         _T("                                 - clear ... do not set metadata\n")
+        _T("   --metadata-copy-rich         preserve QuickTime/NLE metadata keys for mp4/mov output.\n")
         _T("\n")
         _T("   --timecode [<string>]        output timecode file.\n")
         _T("\n")

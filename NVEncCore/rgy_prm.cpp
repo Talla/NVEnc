@@ -2526,6 +2526,7 @@ RGYParamCommon::RGYParamCommon() :
     offsetVideoDtsAdvance(false),
     allowOtherNegativePts(false),
     disableMp4Opt(false),
+    metadataCopyRich(false),
     debugDirectAV1Out(false),
     debugRawOut(false),
     outReplayFile(),

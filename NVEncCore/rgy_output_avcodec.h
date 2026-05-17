@@ -125,6 +125,7 @@ struct AVMuxFormat {
     bool                  fileHeaderWritten;    //ファイルヘッダを出力したかどうか
     AVDictionary         *headerOptions;        //ヘッダオプション
     bool                  disableMp4Opt;        //mp4出力時のmuxの最適化(faststart)を無効にする
+    bool                  metadataCopyRich;     //QuickTime系metadata keyをuse_metadata_tagsで保持する
     bool                  lowlatency;           //低遅延モード
     bool                  offsetVideoDtsAdvance; //映像の負のdtsを避ける (ts_output_offsetを使う)
     bool                  allowOtherNegativePts; //音声・字幕の負のptsを許可するかどうか
@@ -430,6 +431,8 @@ struct AvcodecWriterPrm {
     tstring                      muxerCmdline;            //encoding_toolに追記するコマンドライン
     bool                         afs;                     //入力が自動フィールドシフト
     bool                         disableMp4Opt;           //mp4出力時のmuxの最適化を無効にする
+    bool                         metadataCopyRich;        //QuickTime系metadata keyをuse_metadata_tagsで保持する
+    bool                         metadataCopyRichKeepCreationTime; //trim/seekしていない場合のみcreation_timeを保持する
     bool                         debugDirectAV1Out;       //AV1出力のデバッグ用
     bool                         HEVCAlphaChannel;        //HEVCのalphaチェンネルを使用するか
     int                          HEVCAlphaChannelMode;    //HEVCのalphaチェンネルのモード
@@ -484,6 +487,8 @@ struct AvcodecWriterPrm {
         muxerCmdline(),
         afs(false),
         disableMp4Opt(false),
+        metadataCopyRich(false),
+        metadataCopyRichKeepCreationTime(false),
         debugDirectAV1Out(false),
         HEVCAlphaChannel(false),
         HEVCAlphaChannelMode(0),
@@ -631,7 +636,7 @@ protected:
     RGY_ERR SetChapters(const vector<const AVChapter *>& chapterList, bool chapterNoTrim);
 
     //metadataの設定
-    RGY_ERR SetMetadata(AVDictionary **metadata, const AVDictionary *srcMetadata, const std::vector<tstring>& metadataOpt, const RGYMetadataCopyDefault defaultCopy, const tstring &trackName);
+    RGY_ERR SetMetadata(AVDictionary **metadata, const AVDictionary *srcMetadata, const std::vector<tstring>& metadataOpt, const RGYMetadataCopyDefault defaultCopy, const tstring &trackName, const bool keepCreationTime = false);
 
     //メッセージを作成
     tstring GetWriterMes();

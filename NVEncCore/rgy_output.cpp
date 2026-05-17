@@ -1453,6 +1453,9 @@ RGY_ERR initWriters(
         writerPrm.muxerCmdline            = muxerCmdline;
         writerPrm.afs                     = isAfs;
         writerPrm.disableMp4Opt           = common->disableMp4Opt;
+        writerPrm.metadataCopyRich        = common->metadataCopyRich;
+        //creation_timeは入力全体の記録開始時刻なので、trim/seekがある場合はコピーしない。
+        writerPrm.metadataCopyRichKeepCreationTime = common->metadataCopyRich && common->nTrimCount == 0 && common->seekSec == 0.0f && common->seekToSec == 0.0f;
         writerPrm.lowlatency              = ctrl->lowLatency;
         writerPrm.parallelEncode          = ctrl->parallelEnc.isEnabled();
         writerPrm.debugDirectAV1Out       = common->debugDirectAV1Out;

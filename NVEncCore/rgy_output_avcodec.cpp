@@ -89,6 +89,33 @@ static bool format_is_y4m(const AVFormatContext *formatCtx) {
     return _stricmp(formatCtx->oformat->name, "yuv4mpegpipe") == 0;
 }
 
+static std::string add_movflag(const char *currentFlags, const char *flag) {
+    std::string flags = currentFlags ? currentFlags : "";
+    bool flagExists = false;
+    for (size_t i = 0; i < flags.length();) {
+        while (i < flags.length() && flags[i] == '+') i++;
+        const auto start = i;
+        while (i < flags.length() && flags[i] != '+') i++;
+        if (flags.substr(start, i - start) == flag) {
+            flagExists = true;
+            break;
+        }
+    }
+    if (!flagExists) {
+        if (flags.length() > 0 && flags.back() != '+') {
+            flags += "+";
+        }
+        flags += flag;
+    }
+    return flags;
+}
+
+static void set_movflag(AVDictionary **options, const char *flag) {
+    const auto entry = av_dict_get(*options, "movflags", nullptr, AV_DICT_MATCH_CASE);
+    const auto flags = add_movflag(entry ? entry->value : nullptr, flag);
+    av_dict_set(options, "movflags", flags.c_str(), AV_DICT_MATCH_CASE);
+}
+
 struct AudioLayoutResolveResult {
     uniuqeRGYChannelLayout layout;
     int channels;
@@ -172,6 +199,7 @@ AVMuxFormat::AVMuxFormat() :
     fileHeaderWritten(false),
     headerOptions(nullptr),
     disableMp4Opt(false),
+    metadataCopyRich(false),
     lowlatency(false),
     offsetVideoDtsAdvance(false),
     allowOtherNegativePts(false),
@@ -835,7 +863,7 @@ tstring RGYOutputAvcodec::AudioGetCodecProfileStr(int profile, AVCodecID codecId
     return _T("default");
 }
 
-RGY_ERR RGYOutputAvcodec::SetMetadata(AVDictionary **metadata, const AVDictionary *srcMetadata, const std::vector<tstring> &metadataOpt, const RGYMetadataCopyDefault defaultCopy, const tstring& trackName) {
+RGY_ERR RGYOutputAvcodec::SetMetadata(AVDictionary **metadata, const AVDictionary *srcMetadata, const std::vector<tstring> &metadataOpt, const RGYMetadataCopyDefault defaultCopy, const tstring& trackName, const bool keepCreationTime) {
     bool metadataCopyAll = false;
     bool metadataCopyLang = false;
     //デフォルトの操作
@@ -881,9 +909,15 @@ RGY_ERR RGYOutputAvcodec::SetMetadata(AVDictionary **metadata, const AVDictionar
             AddMessage(RGY_LOG_DEBUG, _T("Copy %s Metadata: key %s, value %s\n"), trackName.c_str(), char_to_tstring(entry->key).c_str(), char_to_tstring(entry->value).c_str());
         }
     }
-    //このあたりは矛盾することがあるので消去
+    //このあたりは矛盾することがあるので消去。
+    //ただし、--metadata-copy-richでは、入力全体を変換する場合に限りcreation_timeを保持する。
+    //通常のmetadata copyは再エンコード後のファイルに古い全体情報を残さない保守的な挙動だが、
+    //カメラ/NLE由来のQuickTime metadataを保持したい場合、記録開始時刻も同じmetadata群の一部として必要になる。
+    //trim/seek時は元ファイル全体の開始時刻を切り出し結果へコピーすると誤解を生むため、従来通り削除する。
     av_dict_set(&m_Mux.format.formatCtx->metadata, "duration", NULL, 0);
-    av_dict_set(&m_Mux.format.formatCtx->metadata, "creation_time", NULL, 0);
+    if (!keepCreationTime) {
+        av_dict_set(&m_Mux.format.formatCtx->metadata, "creation_time", NULL, 0);
+    }
     //ユーザー指定のパラメータの指定
     for (const auto& m : metadataOpt) {
         if (m == RGY_METADATA_CLEAR || m == RGY_METADATA_COPY) {
@@ -2427,6 +2461,7 @@ RGY_ERR RGYOutputAvcodec::Init(const TCHAR *strFileName, const VideoInfo *videoO
 
     m_Mux.format.isMatroska = format_is_mkv(m_Mux.format.formatCtx);
     m_Mux.format.disableMp4Opt = prm->disableMp4Opt;
+    m_Mux.format.metadataCopyRich = prm->metadataCopyRich;
     m_Mux.format.lowlatency = prm->lowlatency;
     m_Mux.format.offsetVideoDtsAdvance = prm->offsetVideoDtsAdvance;
     m_Mux.format.allowOtherNegativePts = prm->allowOtherNegativePts;
@@ -2587,7 +2622,7 @@ RGY_ERR RGYOutputAvcodec::Init(const TCHAR *strFileName, const VideoInfo *videoO
 
     SetChapters(prm->chapterList, prm->chapterNoTrim);
 
-    auto ret = SetMetadata(&m_Mux.format.formatCtx->metadata, prm->inputFormatMetadata, prm->formatMetadata, RGY_METADATA_DEFAULT_COPY, _T("Container"));
+    auto ret = SetMetadata(&m_Mux.format.formatCtx->metadata, prm->inputFormatMetadata, prm->formatMetadata, RGY_METADATA_DEFAULT_COPY, _T("Container"), prm->metadataCopyRichKeepCreationTime);
     if (ret != RGY_ERR_NONE) {
         return ret;
     }
@@ -2886,8 +2921,16 @@ RGY_ERR RGYOutputAvcodec::WriteFileHeader(const RGYBitstream *bitstream) {
 
             if (!m_Mux.format.disableMp4Opt) {
                 //moovを先頭に
-                av_dict_set(&m_Mux.format.headerOptions, "movflags", "faststart", 0);
+                set_movflag(&m_Mux.format.headerOptions, "faststart");
                 AddMessage(RGY_LOG_DEBUG, _T("set faststart.\n"));
+            }
+            if (m_Mux.format.metadataCopyRich) {
+                //libavformatのmov/mp4 muxerは通常のmetadata tagへ寄せるため、
+                //reverse-DNS形式などQuickTime/NLE固有のkeyは失われる場合がある。
+                //use_metadata_tagsを明示して、入力からcopyしたmetadata keyをそのまま書ける形式へ切り替える。
+                //ユーザー指定のmovflagsがある場合は上書きせず、必要なflagだけ追加する。
+                set_movflag(&m_Mux.format.headerOptions, "use_metadata_tags");
+                AddMessage(RGY_LOG_DEBUG, _T("set use_metadata_tags.\n"));
             }
         }
     }
