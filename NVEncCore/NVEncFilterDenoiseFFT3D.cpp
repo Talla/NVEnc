@@ -186,7 +186,12 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
             return RGY_ERR_UNSUPPORTED;
         }
 
-        if ((sts = m_bufFFT.alloc(blockGlobalWidth * complexSize, blockGlobalHeight * complexSize, fft_csp, prm->fft3d.effectiveTbsize())) != RGY_ERR_NONE) {
+        // Each row holds blockGlobalWidth complex values (hence * complexSize in
+        // bytes); the kernels index rows as global_by * block_size + y, i.e. only
+        // blockGlobalHeight of them. Scaling the height by complexSize too made each
+        // fp32 buffer 8x larger than used: ~11 GB VRAM at 4K for temporal=1, and a
+        // tbsize=5 ring overflowed 16 GB into WDDM paging (every kernel 3-500x slower).
+        if ((sts = m_bufFFT.alloc(blockGlobalWidth * complexSize, blockGlobalHeight, fft_csp, prm->fft3d.effectiveTbsize())) != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to allocate memory for FFT: %s.\n"), get_err_mes(sts));
             return sts;
         }
