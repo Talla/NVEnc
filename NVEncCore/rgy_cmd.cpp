@@ -3009,7 +3009,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "prec", "sigma_curve"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3109,6 +3109,21 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                 if (param_arg == _T("temporal")) {
                     try {
                         vpp->fft3d.temporal = std::stoi(param_val);
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("tbsize")) {
+                    // Explicit temporal window size. Accepts 1, 3, or 5. Overrides `temporal`.
+                    try {
+                        int tb = std::stoi(param_val);
+                        if (tb != 1 && tb != 3 && tb != 5) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->fft3d.tbsize = tb;
                     } catch (...) {
                         print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
                         return 1;
