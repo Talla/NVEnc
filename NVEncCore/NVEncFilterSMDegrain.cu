@@ -4,7 +4,8 @@
 // nvenc-smdegrain port — Phase 5e filter implementation.
 //
 // Wires the validated standalone kernels (ME pyramid + MC + bounded blend) into the
-// NVEncC filter chain. Phase 5e MVP scope:
+// NVEncC filter chain. Now bidirectional (tr past + tr future refs, tr-frame delay).
+// Original Phase 5e MVP scope, kept for history:
 //   - tr=1 causal mode only (current + previous frame — no future lookahead delay).
 //   - Y plane is denoised; U and V planes pass through unchanged.
 //   - 8-bit only (YV12). 10-bit rejected with a clear error in checkParam.
@@ -236,6 +237,10 @@ RGY_ERR NVEncFilterSMDegrain::init(shared_ptr<NVEncFilterParam> pParam, shared_p
     }
 
     setFilterInfo(pParam->print());
+    // Output trails input by tr frames (bidirectional refs), so timestamps and
+    // flags must come from the processed ring frame, not the current input.
+    m_pathThrough = FILTER_PATHTHROUGH_ALL;
+    m_pathThrough &= ~(FILTER_PATHTHROUGH_TIMESTAMP | FILTER_PATHTHROUGH_FLAGS | FILTER_PATHTHROUGH_DATA);
     m_param = pParam;
     return RGY_ERR_NONE;
 }
@@ -311,6 +316,7 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
             AddMessage(RGY_LOG_ERROR, _T("SMDegrain: failed to copy input into ring: %s.\n"), get_err_mes(sts));
             return sts;
         }
+        copyFramePropWithoutRes(&inRing->frame, pInputFrame);
         auto inY = getPlane(&inRing->frame, RGY_PLANE_Y);
         const int pitch_in_pixels = inY.pitch[0] / (int)sizeof(T);
         T* d_in_l1 = (T*)m_l1Buf[in_slot]->ptr;
@@ -324,16 +330,18 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     }
 
     // --- Emit decision ---
-    // Phase 5f causal-only mode: emit the latest received frame each input call, using
-    // up to tr past refs. Bidirectional (future refs too) was designed and the kernel
-    // supports it (NREFS up to 6) but the EOS flush plumbing produces lost tail frames —
-    // NVEncC's filter framework expects 1 output per input on this pipeline and --frames N
-    // at the decoder side doesn't trigger the null-input flush path we'd need. For now we
-    // ship causal-only; the ring/L1/MV/MC structures are already sized for 2*tr refs so
-    // bidirectional can be enabled once the flush path is worked out.
+    // Bidirectional, as SMDegrain: frame k uses up to tr past and tr future refs, so
+    // output trails input by tr frames. While streaming, emit k = m_ringIdx-1-tr once
+    // that many frames are buffered; at EOS (null input) the remaining tr frames drain
+    // one per call with whatever future refs exist. NVEncC keeps calling with null input
+    // until a filter returns no frame (fft3d tbsize>1 drains the same way).
     int emit_k = -1;
-    if (!is_flush && m_ringIdx > 0) {
-        emit_k = m_ringIdx - 1;
+    if (!is_flush) {
+        if (m_ringIdx - 1 - tr >= m_outputIdx) {
+            emit_k = m_outputIdx;
+        }
+    } else if (m_outputIdx < m_ringIdx) {
+        emit_k = m_outputIdx;
     }
     if (emit_k < 0) {
         *pOutputFrameNum = 0;
