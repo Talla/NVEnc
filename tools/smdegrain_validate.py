@@ -34,7 +34,7 @@ VSPIPE = shutil.which("vspipe") or r"C:/Users/Eduard/AppData/Local/Programs/Vapo
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 FIXTURES = {
-    "xh2s":  r"Q:/selectcode/20260416 ifh hannover/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV",
+    "xh2s":  r"E:/temp/video-filters-testing/source-clips/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV",
     "ax700": r"E:/temp/video-filters-testing/source-intermediates/sony ax700/C0054.mov",
 }
 

@@ -4,7 +4,7 @@
 
 set -e
 BIN="D:/python_playground/NVEnc/_build/x64/RelStatic/NVEncC64.exe"
-SRC="Q:/selectcode/20260416 ifh hannover/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV"
+SRC="E:/temp/video-filters-testing/source-clips/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV"
 OUTDIR="D:/python_playground/NVEnc/_validation"
 COMMON_FFT3D_ARGS="amount=1.0,block_size=32,overlap=0.5,temporal=1,method=0,prec=auto"
 

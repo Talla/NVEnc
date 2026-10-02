@@ -40,7 +40,7 @@ SMDEGRAIN_MEDIUM_CS = {
 CLIPS = [
     {
         "name":     "xh2s_iso3200",
-        "src":      r"Q:/selectcode/20260416 ifh hannover/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV",
+        "src":      r"E:/temp/video-filters-testing/source-clips/denoise real world samples xh2s/fuji_xh2s_flog2c_4k_iso3200_XH2S3466.MOV",
         "profile":  "fujifilm_xh2s_bundled.json",
         "pp":       "com.fujifilm.f-cinegamut.f-log2",
         "gain_key": "3200",
