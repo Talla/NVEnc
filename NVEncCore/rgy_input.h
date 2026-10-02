@@ -240,6 +240,12 @@ public:
     virtual int64_t GetVideoFirstKeyPts() const {
         return -1;
     }
+    // True when open-GOP leading frames (decode order after the first keyframe,
+    // display order before it) are kept: GetVideoFirstKeyPts() then returns the
+    // earliest leading frame's pts and decoders must not drop frames before it.
+    virtual bool KeepsLeadingFrames() const {
+        return false;
+    }
     virtual bool rffAware() const {
         return false;
     }

@@ -5890,6 +5890,10 @@ int parse_one_common_option(const TCHAR *option_name, const TCHAR *strInput[], i
         common->videoIgnoreTimestampError = value;
         return 0;
     }
+    if (IS_OPTION("keep-leading-frames")) {
+        common->keepLeadingFrames = true;
+        return 0;
+    }
     if (IS_OPTION("audio-samplerate")) {
         try {
             auto ret = set_audio_prm([](AudioSelect *pAudioSelect, int trackId, const TCHAR *prmstr) {
@@ -8853,6 +8857,7 @@ tstring gen_cmd(const RGYParamCommon *param, const RGYParamCommon *defaultPrm, b
     }
     OPT_NUM(_T("--audio-ignore-decode-error"), audioIgnoreDecodeError);
     OPT_NUM(_T("--video-ignore-timestamp-error"), videoIgnoreTimestampError);
+    OPT_BOOL(_T("--keep-leading-frames"), _T(""), keepLeadingFrames);
 
     tmp.str(tstring());
     for (int i = 0; i < param->nSubtitleSelectCount; i++) {

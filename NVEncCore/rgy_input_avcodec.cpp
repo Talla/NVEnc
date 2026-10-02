@@ -71,6 +71,7 @@ AVDemuxFormat::AVDemuxFormat() :
     lowLatency(false),
     audioReadOffsetSec(0.0),
     timestampPassThrough(false),
+    keepLeadingFrames(false),
     preReadBufferIdx(0),
     audioTracks(0),
     subtitleTracks(0),
@@ -133,6 +134,11 @@ AVDemuxVideo::AVDemuxVideo() :
     streamPtsInvalid(0),
     RFFEstimate(0),
     gotFirstKeyframe(false),
+    firstKeyIsFirstPkt(false),
+    leadingFrames(0),
+    leadingMinPts(AV_NOPTS_VALUE),
+    leadingPts(),
+    leadingFramesKept(false),
     bsfcCtx(nullptr),
     extradata(nullptr),
     extradataSize(0),
@@ -275,6 +281,7 @@ RGYInputAvcodecPrm::RGYInputAvcodecPrm(RGYInputPrm base) :
     lowLatency(false),
     audioReadOffsetSec(0.0),
     timestampPassThrough(false),
+    keepLeadingFrames(false),
     qpTableListRef(nullptr),
     inputOpt(),
     hevcbsf(RGYHEVCBsf::INTERNAL),
@@ -1508,6 +1515,7 @@ RGY_ERR RGYInputAvcodec::initFormatCtx(const TCHAR *strFileName, const RGYInputA
         || filename_char.c_str() == strstr(filename_char.c_str(), R"(\\.\pipe\)");
     m_Demux.format.analyzeSec = input_prm->analyzeSec;
     m_Demux.format.timestampPassThrough = input_prm->timestampPassThrough;
+    m_Demux.format.keepLeadingFrames = input_prm->keepLeadingFrames;
     m_Demux.format.formatCtx = avformat_alloc_context();
     if (input_prm->probesize >= 0 || input_prm->analyzeSec >= 0) {
         // probesizeの設定
@@ -2202,6 +2210,30 @@ RGY_ERR RGYInputAvcodec::Init(const TCHAR *strFileName, VideoInfo *inputInfo, co
             return sts;
         }
 
+        // --keep-leading-frames: an open GOP at the very start of the file (camera
+        // originals) has frames that follow the first keyframe in decode order but are
+        // shown before it. They only reference that keyframe, decode correctly, and are
+        // part of the recording, so keep them instead of starting the output at the
+        // keyframe. The video (and with it audio/subtitle/data) origin moves to the
+        // earliest of them, and the trim offset no longer counts them as dropped.
+        // Not applied after a seek or when packets were skipped before the keyframe:
+        // there the leading frames reference pictures that were never decoded.
+        if (m_Demux.format.keepLeadingFrames
+            && m_Demux.video.leadingFrames > 0
+            && m_Demux.video.firstKeyIsFirstPkt
+            && m_seek.first <= 0.0f
+            && m_Demux.video.leadingMinPts != AV_NOPTS_VALUE
+            && m_Demux.video.leadingMinPts < m_Demux.video.streamFirstKeyPts) {
+            AddMessage(RGY_LOG_INFO, _T("keep %d open-GOP leading frame(s): first pts %lld (%s), keyframe pts %lld.\n"),
+                m_Demux.video.leadingFrames,
+                (long long int)m_Demux.video.leadingMinPts, getTimestampString(m_Demux.video.leadingMinPts, m_Demux.video.stream->time_base).c_str(),
+                (long long int)m_Demux.video.streamFirstKeyPts);
+            m_trimParam.offset = std::max(0, m_trimParam.offset - m_Demux.video.leadingFrames);
+            m_Demux.video.streamFirstKeyPts = m_Demux.video.leadingMinPts;
+            std::sort(m_Demux.video.leadingPts.begin(), m_Demux.video.leadingPts.end());
+            m_Demux.video.leadingFramesKept = true;
+        }
+
         if (m_inputVideoInfo.frames > 0) {
             // avsw/avhwでは、--framesは--trimに置き換えて実現する
             for (int itrim = 0; itrim < input_prm->nTrimCount; itrim++) {
@@ -2626,6 +2658,10 @@ int64_t RGYInputAvcodec::GetVideoFirstKeyPts() const {
     return m_Demux.video.streamFirstKeyPts;
 }
 
+bool RGYInputAvcodec::KeepsLeadingFrames() const {
+    return m_Demux.video.leadingFramesKept;
+}
+
 FramePosList *RGYInputAvcodec::GetFramePosList() {
     return &m_Demux.frames;
 }
@@ -2703,8 +2739,26 @@ bool RGYInputAvcodec::checkStreamPacketToAdd(AVPacket *pkt, AVDemuxStream *strea
         stream->lastVidIndex = getVideoFrameIdx(pkt->pts, stream->timebase, stream->lastVidIndex);
     }
 
+    // --keep-leading-frames: the frame list starts at the first keyframe, but the output
+    // starts with the kept open-GOP leading frames. Work in output frame indices (those of
+    // the trim ranges): output index = list index + lead, outputs 0..lead-1 = leading frames.
+    const int lead = (m_Demux.video.leadingFramesKept) ? (int)m_Demux.video.leadingPts.size() : 0;
+    auto outFramePts = [&](int outIdx) -> int64_t {
+        return (outIdx < lead) ? m_Demux.video.leadingPts[outIdx] : m_Demux.frames.list(outIdx - lead).pts;
+    };
+    int outIdx = stream->lastVidIndex + lead;
+    if (lead > 0 && stream->lastVidIndex < 0 && pkt->pts != AV_NOPTS_VALUE && m_Demux.video.stream) {
+        // before the keyframe: which leading frame does this packet start in?
+        outIdx = -1;
+        for (int k = 0; k < lead; k++) {
+            if (av_compare_ts(m_Demux.video.leadingPts[k], m_Demux.video.stream->time_base, pkt->pts + pkt->duration, stream->timebase) < 0) {
+                outIdx = k;
+            }
+        }
+    }
+
     //該当フレームが-1フレーム未満なら、その音声はこの動画には含まれない
-    if (stream->lastVidIndex < 0) {
+    if (outIdx < 0) {
         //timestampをそのまま転送する場合、音声/字幕が映像に含まれなくてもそのまま転送する
         if (m_Demux.format.timestampPassThrough) {
             //時刻を補正
@@ -2725,9 +2779,11 @@ bool RGYInputAvcodec::checkStreamPacketToAdd(AVPacket *pkt, AVDemuxStream *strea
         return false;
     }
 
-    const auto vidFramePos = &m_Demux.frames.list((std::max)(stream->lastVidIndex, 0));
-    const int64_t vid1_fin = convertTimebaseVidToStream(vidFramePos->pts + ((stream->lastVidIndex >= 0) ? vidFramePos->duration : 0), stream);
-    const int64_t vid2_start = convertTimebaseVidToStream(m_Demux.frames.list((std::max)(stream->lastVidIndex+1, 0)).pts, stream);
+    // current output frame: start pts and duration (a leading frame lasts until the next one)
+    const int64_t vidCurPts = outFramePts(outIdx);
+    const int64_t vidCurDuration = (outIdx < lead) ? (outFramePts(outIdx + 1) - vidCurPts) : m_Demux.frames.list(outIdx - lead).duration;
+    const int64_t vid1_fin = convertTimebaseVidToStream(vidCurPts + vidCurDuration, stream);
+    const int64_t vid2_start = convertTimebaseVidToStream(outFramePts(outIdx + 1), stream);
 
     int64_t aud1_start = pkt->pts;
     int64_t aud1_fin   = pkt->pts + pkt->duration;
@@ -2735,8 +2791,8 @@ bool RGYInputAvcodec::checkStreamPacketToAdd(AVPacket *pkt, AVDemuxStream *strea
     //block index (空白がtrimで削除された領域)
     //       #0       #0         #1         #1       #2    #2
     //   |        |----------|         |----------|     |------
-    const auto frame_is_in_range = frame_inside_range(stream->lastVidIndex,     m_trimParam.list);
-    const auto next_is_in_range  = frame_inside_range(stream->lastVidIndex + 1, m_trimParam.list);
+    const auto frame_is_in_range = frame_inside_range(outIdx,     m_trimParam.list);
+    const auto next_is_in_range  = frame_inside_range(outIdx + 1, m_trimParam.list);
     const auto frame_trim_block_index = frame_is_in_range.second;
 
     bool result = true; //動画に含まれる音声かどうか
@@ -2790,15 +2846,15 @@ bool RGYInputAvcodec::checkStreamPacketToAdd(AVPacket *pkt, AVDemuxStream *strea
                 //まだ一度も音声のパケットが渡されていない
                 //基本的には動画の情報を基準に情報を修正する
                 const int first_vid_frame = (m_trimParam.list.size() > 0) ? m_trimParam.list[0].start : 0;
-                const int64_t vid0_start = convertTimebaseVidToStream(m_Demux.frames.list(first_vid_frame).pts, stream);
+                const int64_t vid0_start = convertTimebaseVidToStream(outFramePts(first_vid_frame), stream);
                 const int64_t vid0_first = convertTimebaseVidToStream(m_Demux.video.streamFirstKeyPts,          stream);
                 stream->trimOffset += std::max<int64_t>(0, vid0_start - vid0_first);
             } else {
                 assert(frame_trim_block_index > 0);
                 const int last_valid_vid_frame = m_trimParam.list[frame_trim_block_index-1].start;
                 assert(last_valid_vid_frame >= 0);
-                const int64_t vid0_fin = convertTimebaseVidToStream(m_Demux.frames.list(last_valid_vid_frame).pts, stream);
-                const int64_t vid1_start = convertTimebaseVidToStream(vidFramePos->pts, stream);
+                const int64_t vid0_fin = convertTimebaseVidToStream(outFramePts(last_valid_vid_frame), stream);
+                const int64_t vid1_start = convertTimebaseVidToStream(vidCurPts, stream);
                 const int64_t vid_start = (frame_is_in_range.first) ? vid1_start : vid2_start;
                 if (vid_start - vid0_fin > aud1_start - stream->aud0_fin) {
                     stream->trimOffset += aud1_start - stream->aud0_fin;
@@ -3000,6 +3056,7 @@ std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcod
                     //だが、これが原因でtrimの値とずれを生じてしまう
                     //そこで、そのぶんのずれを記録しておき、Trim値などに補正をかける
                     m_trimParam.offset = i_samples;
+                    m_Demux.video.firstKeyIsFirstPkt = (i_samples == 0);
                     AddMessage(RGY_LOG_DEBUG, _T("found first key frame: timestamp %lld (%s), offset %d\n"),
                         (long long int)m_Demux.video.streamFirstKeyPts, getTimestampString(m_Demux.video.streamFirstKeyPts, m_Demux.video.stream->time_base).c_str(),
                         m_trimParam.offset);
@@ -3008,6 +3065,13 @@ std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcod
                     // こうした場合にoffsetを加算しておかないとtrimがずれる
                     // PAFF等でAV_NOPTS_VALUEが一部のフレームで来る場合( RGY_PTS_HALF_INVALID )はきちんと考慮できていないが、そこはあきらめる
                     m_trimParam.offset++;
+                    if (!m_Demux.video.leadingFramesKept) {
+                        m_Demux.video.leadingFrames++;
+                        m_Demux.video.leadingPts.push_back(timestamp);
+                        if (m_Demux.video.leadingMinPts == AV_NOPTS_VALUE || timestamp < m_Demux.video.leadingMinPts) {
+                            m_Demux.video.leadingMinPts = timestamp;
+                        }
+                    }
                 }
                 m_Demux.frames.add(pos);
             }

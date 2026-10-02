@@ -679,6 +679,7 @@ RGY_ERR initReaders(
         inputInfoAVCuvid.lowLatency = ctrl->lowLatency;
         inputInfoAVCuvid.audioReadOffsetSec = (ctrl->lowLatency) ? ((output_is_pipe(common)) ? 0.0 : 2.0) : 0.0;
         inputInfoAVCuvid.timestampPassThrough = common->timestampPassThrough;
+        inputInfoAVCuvid.keepLeadingFrames = common->keepLeadingFrames;
         inputInfoAVCuvid.hevcbsf = common->hevcbsf;
         inputInfoAVCuvid.avswDecoder = inprm->avswDecoder;
         pInputPrm = &inputInfoAVCuvid;

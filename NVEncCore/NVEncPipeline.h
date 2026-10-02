@@ -1428,6 +1428,11 @@ public:
                 m_dataFlag.push(flags);
                 if (m_hwDecFirstPts == AV_NOPTS_VALUE) {
                     m_hwDecFirstPts = bitstream.pts();
+                    // --keep-leading-frames: frames shown before the first keyframe are
+                    // part of the output; don't drop them as pre-keyframe leftovers.
+                    if (m_input->KeepsLeadingFrames()) {
+                        m_hwDecFirstPts = std::min(m_hwDecFirstPts, m_input->GetVideoFirstKeyPts());
+                    }
                 }
                 PrintMes(RGY_LOG_TRACE, _T("Set packet #%d, size %zu, pts %lld (%s)\n"), i, bitstream.size(),
                     (long long int)bitstream.pts(), getTimestampString(bitstream.pts(), av_make_q(m_input->getInputTimebase())).c_str());

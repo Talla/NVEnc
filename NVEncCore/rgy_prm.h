@@ -2645,6 +2645,7 @@ struct RGYParamCommon {
     bool chapterNoTrim;
     int audioIgnoreDecodeError;
     int videoIgnoreTimestampError;
+    bool keepLeadingFrames; // keep open-GOP frames shown before the first keyframe (avhw/avsw)
     RGYOptList muxOpt;
     bool offsetVideoDtsAdvance;
     bool allowOtherNegativePts;

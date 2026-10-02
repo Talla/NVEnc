@@ -714,6 +714,7 @@ struct AVDemuxFormat {
     bool                      lowLatency;            //低遅延モード
     double                    audioReadOffsetSec;    //映像終了後に通す音声の余裕秒数
     bool                      timestampPassThrough;  //timestampをそのまま通す
+    bool                      keepLeadingFrames;     //open GOP先頭のキーフレームより前に表示されるフレームを残す
     uint32_t                  preReadBufferIdx;      //先読みバッファの読み込み履歴
     int                       audioTracks;           //存在する音声のトラック数
     int                       subtitleTracks;        //存在する字幕のトラック数
@@ -751,6 +752,11 @@ struct AVDemuxVideo {
     uint32_t                  streamPtsInvalid;      //動画ファイルのptsが無効 (H.264/ES, 等)
     int                       RFFEstimate;           //動画がRFFの可能性がある
     bool                      gotFirstKeyframe;      //動画の最初のキーフレームを取得済み
+    bool                      firstKeyIsFirstPkt;    //最初のキーフレームの前にスキップしたパケットがない
+    int                       leadingFrames;         //最初のキーフレームより前に表示されるフレーム数 (open GOP)
+    int64_t                   leadingMinPts;         //それらのフレームの最小pts
+    std::vector<int64_t>      leadingPts;            //それらのフレームのpts (昇順, keep時に確定)
+    bool                      leadingFramesKept;     //それらのフレームを残す (streamFirstKeyPts = leadingMinPts)
     AVBSFContext             *bsfcCtx;               //必要なら使用するbitstreamfilter
     uint8_t                  *extradata;             //動画のヘッダ情報
     int                       extradataSize;         //動画のヘッダサイズ
@@ -861,6 +867,7 @@ public:
     bool           lowLatency;
     double         audioReadOffsetSec;      //映像終了後に通す音声の余裕秒数
     bool           timestampPassThrough;    //timestampをそのまま出力する
+    bool           keepLeadingFrames;       //open GOP先頭のキーフレームより前に表示されるフレームを残す
     RGYListRef<RGYFrameDataQP> *qpTableListRef; //qp tableを格納するときのベース構造体
     RGYOptList     inputOpt;                //入力オプション
     RGYHEVCBsf     hevcbsf;
@@ -934,6 +941,9 @@ public:
 
     //動画の最初のフレームのptsを取得する
     virtual int64_t GetVideoFirstKeyPts() const override;
+
+    //open GOP先頭のキーフレームより前に表示されるフレームを残すか
+    virtual bool KeepsLeadingFrames() const override;
 
     //入力に使用可能なdeviceIDを取得する
     const std::set<int>& GetHWDecDeviceID() const;
