@@ -3009,7 +3009,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve", "slocation"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3036,7 +3036,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                     }
                     continue;
                 }
-                if (param_arg == _T("sigma_curve")) {
+                if (param_arg == _T("sigma_curve") || param_arg == _T("slocation")) {
                     // Parse dfttest-style slocation: freq/sigma;freq/sigma;...
                     // Normalized frequencies must be strictly increasing, 0.0 <= f <= 1.0, sigma >= 0.
                     // Note: param_val arrives with ';' intact since split() above splits only on ','.
@@ -3058,6 +3058,7 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                         return 1;
                     }
                     vpp->fft3d.sigma_curve = std::move(curve);
+                    vpp->fft3d.sigma_curve_dfttest = (param_arg == _T("slocation"));
                     continue;
                 }
                 if (param_arg == _T("amount")) {

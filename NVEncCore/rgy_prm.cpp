@@ -1511,7 +1511,8 @@ VppDenoiseFFT3D::VppDenoiseFFT3D() :
     temporal(FILTER_DEFAULT_DENOISE_FFT3D_TEMPORAL),
     tbsize(0),
     precision(VppFpPrecision::VPP_FP_PRECISION_AUTO),
-    sigma_curve() {
+    sigma_curve(),
+    sigma_curve_dfttest(false) {
 
 }
 
@@ -1526,7 +1527,8 @@ bool VppDenoiseFFT3D::operator==(const VppDenoiseFFT3D &x) const {
         && temporal == x.temporal
         && tbsize == x.tbsize
         && precision == x.precision
-        && sigma_curve == x.sigma_curve;
+        && sigma_curve == x.sigma_curve
+        && sigma_curve_dfttest == x.sigma_curve_dfttest;
 }
 bool VppDenoiseFFT3D::operator!=(const VppDenoiseFFT3D &x) const {
     return !(*this == x);
@@ -1537,7 +1539,7 @@ tstring VppDenoiseFFT3D::print() const {
         "                         overlap %.2f, method %d, tbsize %d, precision %s"),
         sigma, amount, block_size, overlap, method, effectiveTbsize(), get_cx_desc(list_vpp_fp_prec, precision));
     if (!sigma_curve.empty()) {
-        str += strsprintf(_T("\n                         sigma_curve (%zu points):"), sigma_curve.size());
+        str += strsprintf(_T("\n                         %s (%zu points):"), sigma_curve_dfttest ? _T("slocation") : _T("sigma_curve"), sigma_curve.size());
         for (const auto &pt : sigma_curve) {
             str += strsprintf(_T(" %.3f/%.3f"), pt.first, pt.second);
         }

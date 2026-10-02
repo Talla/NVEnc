@@ -105,6 +105,7 @@ protected:
     std::unique_ptr<CUMemBuf> m_sigmaTable;
     // Cached inputs used to build m_sigmaTable — lets us skip rebuild if unchanged.
     std::vector<std::pair<float, float>> m_sigmaTableCurve;
+    bool m_sigmaTableDfttest;
     int m_sigmaTableBlockSize;
     int m_sigmaTableTemporalCount;
     int m_sigmaTableBitDepth;

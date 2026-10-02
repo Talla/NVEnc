@@ -82,6 +82,7 @@ NVEncFilterDenoiseFFT3D::NVEncFilterDenoiseFFT3D() :
     m_windowBufInverse(),
     m_sigmaTable(),
     m_sigmaTableCurve(),
+    m_sigmaTableDfttest(false),
     m_sigmaTableBlockSize(0),
     m_sigmaTableTemporalCount(0),
     m_sigmaTableBitDepth(0) {
@@ -153,6 +154,13 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         return sts;
     }
     if (prm->fft3d.precision != VppFpPrecision::VPP_FP_PRECISION_FP32 && prm->compute_capability.first < 7) {
+        prm->fft3d.precision = VppFpPrecision::VPP_FP_PRECISION_FP32;
+    }
+    // The per-bin sigma table holds power values that fp16 cannot represent well
+    // (slocation fp16 output measured VMAF ~62 vs ~100 in fp32), so curves run in fp32.
+    if (!prm->fft3d.sigma_curve.empty() && prm->fft3d.precision != VppFpPrecision::VPP_FP_PRECISION_FP32) {
+        AddMessage(RGY_LOG_WARN, _T("%s requires fp32 precision; using prec=fp32.\n"),
+            prm->fft3d.sigma_curve_dfttest ? _T("slocation") : _T("sigma_curve"));
         prm->fft3d.precision = VppFpPrecision::VPP_FP_PRECISION_FP32;
     }
     if (!m_param
@@ -249,16 +257,83 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         const int temporalCount = prm->fft3d.effectiveTbsize();
         const int bit_depth = RGY_CSP_BIT_DEPTH[prm->frameOut.csp];
         const auto &curve = prm->fft3d.sigma_curve;
+        const bool dfttestMode = prm->fft3d.sigma_curve_dfttest;
 
         const bool paramsChanged =
             block_size != m_sigmaTableBlockSize ||
             temporalCount != m_sigmaTableTemporalCount ||
             bit_depth != m_sigmaTableBitDepth ||
-            curve != m_sigmaTableCurve;
+            curve != m_sigmaTableCurve ||
+            dfttestMode != m_sigmaTableDfttest;
 
         if (paramsChanged) {
             if (curve.empty()) {
                 m_sigmaTable.reset();
+            } else if (dfttestMode) {
+                // slocation= : dfttest semantics (AviSynth dfttest docs, sstring default system).
+                //  * Each dimension's frequency is normalized on its own to [0,1]
+                //    (0 = DC, 1 = highest frequency of that dimension).
+                //  * Sigma values are raised to 1/ndim, interpolated per dimension,
+                //    and the per-dimension results multiplied.
+                //  * Sigma is noise power in 8-bit units, normalized by the analysis
+                //    window's non-coherent power gain.
+                const size_t lutCount = (size_t)temporalCount * block_size * block_size;
+                std::vector<float> lut(lutCount);
+                const int ndim = (temporalCount > 1) ? 3 : 2;
+                std::vector<std::pair<float, float>> rootCurve;
+                for (const auto &pt : curve) {
+                    rootCurve.emplace_back(pt.first, std::pow(pt.second, 1.0f / (float)ndim));
+                }
+                auto interp = [&rootCurve](float f) {
+                    if (f <= rootCurve.front().first) return rootCurve.front().second;
+                    if (f >= rootCurve.back().first) return rootCurve.back().second;
+                    for (size_t i = 1; i < rootCurve.size(); i++) {
+                        if (f <= rootCurve[i].first) {
+                            const float t = (f - rootCurve[i - 1].first) / (rootCurve[i].first - rootCurve[i - 1].first);
+                            return rootCurve[i - 1].second + t * (rootCurve[i].second - rootCurve[i - 1].second);
+                        }
+                    }
+                    return rootCurve.back().second;
+                };
+                // Power gain of the Hann analysis window applied in fft() (same winFunc as m_windowBuf)
+                // per spatial dimension; the temporal dimension is rectangular, gain = temporalCount.
+                // The kernel compares |DFT|^2 of [0,1]-normalized pixels against the table, so an
+                // 8-bit-unit noise power maps to sigma * gain / 255^2 for every bit depth.
+                double gain1d = 0.0;
+                for (int i = 0; i < block_size; i++) {
+                    const double w = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / (double)block_size);
+                    gain1d += w * w;
+                }
+                const float norm = (float)(gain1d * gain1d * temporalCount / (255.0 * 255.0));
+                const int tHalf = std::max(temporalCount / 2, 1);
+                for (int bz = 0; bz < temporalCount; bz++) {
+                    const float fz = (float)std::min(bz, temporalCount - bz) / (float)tHalf;
+                    for (int by = 0; by < block_size; by++) {
+                        const float fy = (float)std::min(by, block_size - by) / ((float)block_size * 0.5f);
+                        for (int bx = 0; bx < block_size; bx++) {
+                            const float fx = (float)std::min(bx, block_size - bx) / ((float)block_size * 0.5f);
+                            float sigma_bin = interp(fx) * interp(fy);
+                            if (temporalCount > 1) {
+                                sigma_bin *= interp(fz);
+                            }
+                            lut[(size_t)bz * block_size * block_size + (size_t)by * block_size + bx] = sigma_bin * norm;
+                        }
+                    }
+                }
+                // zmean: dfttest removes the window mean before filtering, so the 3D DC bin passes untouched.
+                lut[0] = 0.0f;
+
+                m_sigmaTable = std::unique_ptr<CUMemBuf>(new CUMemBuf(lutCount * sizeof(float)));
+                if ((sts = m_sigmaTable->alloc()) != RGY_ERR_NONE) {
+                    AddMessage(RGY_LOG_ERROR, _T("failed to allocate memory for slocation LUT: %s.\n"), get_err_mes(sts));
+                    return sts;
+                }
+                if ((sts = err_to_rgy(cudaMemcpy(m_sigmaTable->ptr, lut.data(), lutCount * sizeof(float), cudaMemcpyHostToDevice))) != RGY_ERR_NONE) {
+                    AddMessage(RGY_LOG_ERROR, _T("failed to copy memory for slocation LUT: %s.\n"), get_err_mes(sts));
+                    return sts;
+                }
+                AddMessage(RGY_LOG_DEBUG, _T("Built slocation LUT: %d x %d x %d (%zu floats), window gain %.3f\n"),
+                    temporalCount, block_size, block_size, lutCount, gain1d * gain1d);
             } else {
                 const size_t lutCount = (size_t)temporalCount * block_size * block_size;
                 std::vector<float> lut(lutCount);
@@ -315,6 +390,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
                     temporalCount, block_size, block_size, lutCount);
             }
             m_sigmaTableCurve = curve;
+            m_sigmaTableDfttest = dfttestMode;
             m_sigmaTableBlockSize = block_size;
             m_sigmaTableTemporalCount = temporalCount;
             m_sigmaTableBitDepth = bit_depth;
@@ -475,6 +551,7 @@ void NVEncFilterDenoiseFFT3D::close() {
     m_windowBufInverse.reset();
     m_sigmaTable.reset();
     m_sigmaTableCurve.clear();
+    m_sigmaTableDfttest = false;
     m_sigmaTableBlockSize = 0;
     m_sigmaTableTemporalCount = 0;
     m_sigmaTableBitDepth = 0;

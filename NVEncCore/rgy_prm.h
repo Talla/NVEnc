@@ -2066,6 +2066,7 @@ struct VppDenoiseFFT3D {
     int tbsize; // 0 = derive from `temporal` (legacy: 0->1, 1->3). Explicit 1/3/5 overrides.
     VppFpPrecision precision;
     std::vector<std::pair<float, float>> sigma_curve; // (normalized_freq, sigma) pairs; empty -> use scalar sigma. dfttest-style slocation.
+    bool sigma_curve_dfttest; // true when given as slocation=: dfttest units/mapping (power, per-dimension product)
     VppDenoiseFFT3D();
     bool operator==(const VppDenoiseFFT3D &x) const;
     bool operator!=(const VppDenoiseFFT3D &x) const;
