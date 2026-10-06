@@ -222,7 +222,7 @@ __global__ void kernel_fft(
     const int width, const int height,
     const int block_count_x,
     const float *const __restrict__ ptrBlockWindow,
-    const int ov1, const int ov2
+    const int ov1, const int ov2, const int gridOffset
 ) {
     const int thWorker = threadIdx.x; // BLOCK_SIZE
     const int local_bx = threadIdx.y; // DENOISE_BLOCK_SIZE_X
@@ -231,8 +231,9 @@ __global__ void kernel_fft(
     const int plane_idx = blockIdx.z;
 
     const int block_eff = BLOCK_SIZE - ov1 - ov1 - ov2;
-    const int block_x = global_bx * block_eff - ov1 - ov2;
-    const int block_y = global_by * block_eff - ov1 - ov2;
+    // gridOffset shifts the whole block grid left/up, so block boundaries move off the codec grid.
+    const int block_x = global_bx * block_eff - ov1 - ov2 - gridOffset;
+    const int block_y = global_by * block_eff - ov1 - ov2 - gridOffset;
 
     char *const __restrict__ ptrDst = selectptr2(ptrDst0, ptrDst1, plane_idx);
     const char *const __restrict__ ptrSrc = selectptr2(ptrSrc0, ptrSrc1, plane_idx);
@@ -284,9 +285,9 @@ __global__ void kernel_fft(
 
 template<typename Type, int bit_depth, typename TypeComplex, int BLOCK_SIZE, int DENOISE_BLOCK_SIZE_X>
 RGY_ERR denoise_fft(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2,
-    const float *ptrBlockWindow, cudaStream_t stream) {
+    const float *ptrBlockWindow, const FFT3DExtra extra, cudaStream_t stream) {
     {
-        auto block_count = getBlockCount(pInputFrame->width, pInputFrame->height, BLOCK_SIZE, ov1, ov2);
+        auto block_count = getBlockCount(pInputFrame->width + extra.offY, pInputFrame->height + extra.offY, BLOCK_SIZE, ov1, ov2);
         const auto planeInputY = getPlane(pInputFrame, RGY_PLANE_Y);
         const auto planeInputA = getPlane(pInputFrame, RGY_PLANE_A);
         auto planeOutputY = getPlane(pOutputFrame, RGY_PLANE_Y);
@@ -298,7 +299,7 @@ RGY_ERR denoise_fft(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame,
             (const char *)planeInputY.ptr[0], (const char *)planeInputA.ptr[0], planeInputY.pitch[0],
             planeInputY.width, planeInputY.height, block_count.first,
             ptrBlockWindow,
-            ov1, ov2
+            ov1, ov2, extra.offY
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
@@ -314,7 +315,7 @@ RGY_ERR denoise_fft(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame,
         if (planeOutputU.pitch[0] != planeOutputV.pitch[0]) {
             return RGY_ERR_UNKNOWN;
         }
-        auto block_count = getBlockCount(planeInputU.width, planeInputU.height, BLOCK_SIZE, ov1, ov2);
+        auto block_count = getBlockCount(planeInputU.width + extra.offUV, planeInputU.height + extra.offUV, BLOCK_SIZE, ov1, ov2);
         dim3 blockSize(BLOCK_SIZE, DENOISE_BLOCK_SIZE_X);
         dim3 gridSize(divCeil(block_count.first, DENOISE_BLOCK_SIZE_X), block_count.second, 2);
         kernel_fft<Type, bit_depth, TypeComplex, BLOCK_SIZE, DENOISE_BLOCK_SIZE_X> << <gridSize, blockSize, 0, stream >> > (
@@ -322,7 +323,7 @@ RGY_ERR denoise_fft(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame,
             (const char *)planeInputU.ptr[0], (const char *)planeInputV.ptr[0], planeInputU.pitch[0],
             planeInputU.width, planeInputU.height, block_count.first,
             ptrBlockWindow,
-            ov1, ov2
+            ov1, ov2, extra.offUV
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
@@ -341,7 +342,7 @@ __device__ complex<TypeComplex> temporal_filter(
     const complex<TypeComplex> *ptrSrcD,
     const complex<TypeComplex> *ptrSrcE,
     const float sigma, const float limit, const int filterMethod,
-    const float *sigmaTable, const int bin_x, const int bin_y) {
+    const float *sigmaTable, const int bin_x, const int bin_y, const float levelFactor2) {
     static_assert(1 <= temporalCount && temporalCount <= 5, "temporalCount must be 1 to 5.");
     static_assert(0 <= temporalCurrentIdx && temporalCurrentIdx < temporalCount, "temporalCurrentIdx must be 0 to temporalCount.");
     complex<TypeComplex> work[temporalCount];
@@ -360,9 +361,10 @@ __device__ complex<TypeComplex> temporal_filter(
         const float power = work[z].squaref();
         // Per-bin sigma² LUT overrides scalar sigma when provided (dfttest slocation semantics).
         // LUT values are pre-squared and /255-normalized host-side to match scalar-path scaling.
-        const float effectiveSigma = (sigmaTable != nullptr)
+        // levelFactor2 = (sigma at this block's brightness / sigma of the curve)^2; 1 when level_scale_* is off.
+        const float effectiveSigma = levelFactor2 * ((sigmaTable != nullptr)
             ? sigmaTable[z * BLOCK_SIZE * BLOCK_SIZE + bin_y * BLOCK_SIZE + bin_x]
-            : sigma;
+            : sigma);
 
         float factor;
         if (filterMethod == 0) {
@@ -401,7 +403,11 @@ __global__ void kernel_tfft_filter_ifft(
     const float *const __restrict__ ptrBlockWindowInverse,
     const int ov1, const int ov2,
     const float sigma, const float limit, const int filterMethod,
-    const float *const __restrict__ sigmaTable
+    const float *const __restrict__ sigmaTable,
+    const float *const __restrict__ levelLut,   // [FFT3D_LEVEL_BINS] for this launch's plane 0; plane 1 at +FFT3D_LEVEL_BINS
+    const char *const __restrict__ lumaDC,      // nullptr: level from this plane's own DC (luma launch)
+    const int lumaDCPitch, const int lumaBlockCountX, const int lumaBlockCountY,
+    const int chromaRatioX, const int chromaRatioY
 ) {
     static_assert(1 <= temporalCount && temporalCount <= 5, "temporalCount must be 1 to 5.");
     const int thWorker = threadIdx.x; // BLOCK_SIZE
@@ -416,6 +422,37 @@ __global__ void kernel_tfft_filter_ifft(
     const char *const __restrict__ ptrSrcC = (temporalCount >= 3) ? selectptr2(ptrSrcC0, ptrSrcC1, plane_idx) : nullptr;
     const char *const __restrict__ ptrSrcD = (temporalCount >= 4) ? selectptr2(ptrSrcD0, ptrSrcD1, plane_idx) : nullptr;
     const char *const __restrict__ ptrSrcE = (temporalCount >= 5) ? selectptr2(ptrSrcE0, ptrSrcE1, plane_idx) : nullptr;
+
+    // Per-brightness sigma: block luma level from the current frame's spatial DC (bin 0,0).
+    // The analysis window is Hann, sum = BLOCK_SIZE/2 per dimension, so level = DC / (BLOCK_SIZE/2)^2.
+    float levelFactor2 = 1.0f;
+    if (levelLut != nullptr && global_bx < block_count_x) {
+        const float dcNorm = 4.0f / (float)(BLOCK_SIZE * BLOCK_SIZE);
+        float level = 0.0f;
+        if (lumaDC == nullptr) {
+            const char *ptrCur = (temporalCurrentIdx == 0) ? ptrSrcA : (temporalCurrentIdx == 1) ? ptrSrcB
+                               : (temporalCurrentIdx == 2) ? ptrSrcC : (temporalCurrentIdx == 3) ? ptrSrcD : ptrSrcE;
+            const complex<TypeComplex> dc = *(const complex<TypeComplex> *)(ptrCur
+                + (global_by * BLOCK_SIZE) * srcPitch + (global_bx * BLOCK_SIZE) * sizeof(complex<TypeComplex>));
+            level = dc.realf() * dcNorm;
+        } else {
+            // chroma block: average the DCs of the co-located luma blocks
+            float acc = 0.0f;
+            for (int ry = 0; ry < chromaRatioY; ry++) {
+                const int lby = min(global_by * chromaRatioY + ry, lumaBlockCountY - 1);
+                for (int rx = 0; rx < chromaRatioX; rx++) {
+                    const int lbx = min(global_bx * chromaRatioX + rx, lumaBlockCountX - 1);
+                    const complex<TypeComplex> dc = *(const complex<TypeComplex> *)(lumaDC
+                        + (lby * BLOCK_SIZE) * lumaDCPitch + (lbx * BLOCK_SIZE) * sizeof(complex<TypeComplex>));
+                    acc += dc.realf();
+                }
+            }
+            level = acc * dcNorm / (float)(chromaRatioX * chromaRatioY);
+        }
+        const int bin = min(max((int)(level * (float)FFT3D_LEVEL_BINS), 0), FFT3D_LEVEL_BINS - 1);
+        // luma launch: plane 1 is alpha, which uses the luma curve; chroma launch: U at +0, V at +BINS
+        levelFactor2 = levelLut[((lumaDC == nullptr) ? 0 : plane_idx) * FFT3D_LEVEL_BINS + bin];
+    }
 #if 1
     __shared__ complex<TypeComplex> stmp[DENOISE_BLOCK_SIZE_X][BLOCK_SIZE][BLOCK_SIZE + 1];
 #if 1
@@ -433,7 +470,7 @@ __global__ void kernel_tfft_filter_ifft(
                 (const complex<TypeComplex> *)(ptrSrcD + src_idx),
                 (const complex<TypeComplex> *)(ptrSrcE + src_idx),
                 sigma, limit, filterMethod,
-                sigmaTable, thWorker, y);
+                sigmaTable, thWorker, y, levelFactor2);
         }
     }
 #else
@@ -486,9 +523,9 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
     const float sigma, const float limit, const int filterMethod,
-    const float *sigmaTable, cudaStream_t stream) {
+    const float *sigmaTable, const FFT3DExtra extra, cudaStream_t stream) {
     {
-        const auto block_count = getBlockCount(widthY, heightY, BLOCK_SIZE, ov1, ov2);
+        const auto block_count = getBlockCount(widthY + extra.offY, heightY + extra.offY, BLOCK_SIZE, ov1, ov2);
         const auto planeInputYA = (pInputFrameA) ? getPlane(pInputFrameA, RGY_PLANE_Y) : RGYFrameInfo();
         const auto planeInputAA = (pInputFrameA) ? getPlane(pInputFrameA, RGY_PLANE_A) : RGYFrameInfo();
         const auto planeInputYB = (pInputFrameB) ? getPlane(pInputFrameB, RGY_PLANE_Y) : RGYFrameInfo();
@@ -516,7 +553,8 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             ptrBlockWindowInverse,
             ov1, ov2,
             sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod,
-            sigmaTable
+            sigmaTable,
+            extra.levelLut, nullptr, 0, 0, 0, 1, 1
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
@@ -540,7 +578,7 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
         if (planeOutputU.pitch[0] != planeOutputV.pitch[0]) {
             return RGY_ERR_UNKNOWN;
         }
-        const auto block_count = getBlockCount(widthUV, heightUV, BLOCK_SIZE, ov1, ov2);
+        const auto block_count = getBlockCount(widthUV + extra.offUV, heightUV + extra.offUV, BLOCK_SIZE, ov1, ov2);
         dim3 blockSize(BLOCK_SIZE, DENOISE_BLOCK_SIZE_X);
         dim3 gridSize(divCeil(block_count.first, DENOISE_BLOCK_SIZE_X), block_count.second, 2);
         kernel_tfft_filter_ifft<TypePixel, bit_depth, TypeComplex, BLOCK_SIZE, DENOISE_BLOCK_SIZE_X, temporalCurrentIdx, temporalCount> << <gridSize, blockSize, 0, stream >> > (
@@ -555,8 +593,10 @@ RGY_ERR denoise_tfft_filter_ifft(RGYFrameInfo *pOutputFrame,
             block_count.first,
             ptrBlockWindowInverse,
             ov1, ov2,
-            sigma * (1.0f / ((1 << 8) - 1)), limit, filterMethod,
-            sigmaTable
+            sigma * (1.0f / ((1 << 8) - 1)), (extra.limitUV >= 0.0f) ? extra.limitUV : limit, filterMethod,
+            sigmaTable,
+            extra.levelLut ? extra.levelLut + FFT3D_LEVEL_BINS : nullptr, extra.lumaDC, extra.lumaDCPitch,
+            extra.lumaBlockCountX, extra.lumaBlockCountY, extra.chromaRatioX, extra.chromaRatioY
         );
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
@@ -577,7 +617,7 @@ __global__ void kernel_merge(
     const int srcPitch,
     const int width, const int height,
     const int block_count_x, const int block_count_y,
-    const int ov1, const int ov2
+    const int ov1, const int ov2, const int gridOffset
 ) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -588,10 +628,13 @@ __global__ void kernel_merge(
     const char *const __restrict__ ptrSrc = selectptr2(ptrSrc0, ptrSrc1, plane_idx);
 
     if (x < width && y < height) {
-        const int block_x = x / block_eff;
-        const int block_y = y / block_eff;
-        const int block_local_pos_x = x - block_x * block_eff + ov1 + ov2;
-        const int block_local_pos_y = y - block_y * block_eff + ov1 + ov2;
+        // position in the (offset) block grid; gridOffset = 0 is the legacy layout
+        const int gx = x + gridOffset;
+        const int gy = y + gridOffset;
+        const int block_x = gx / block_eff;
+        const int block_y = gy / block_eff;
+        const int block_local_pos_x = gx - block_x * block_eff + ov1 + ov2;
+        const int block_local_pos_y = gy - block_y * block_eff + ov1 + ov2;
         int shift = 0;
 #define BLOCK_VAL(x, y) (((TypePixel *)(ptrSrc + (y) * srcPitch + (x) * sizeof(TypePixel)))[0])
 #if 1
@@ -616,19 +659,20 @@ __global__ void kernel_merge(
 }
 
 template<typename TypePixel, int BLOCK_SIZE>
-RGY_ERR denoise_merge(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2, cudaStream_t stream) {
+RGY_ERR denoise_merge(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2,
+    const FFT3DExtra extra, cudaStream_t stream) {
     {
         const auto planeInputY = getPlane(pInputFrame, RGY_PLANE_Y);
         const auto planeInputA = getPlane(pInputFrame, RGY_PLANE_A);
         auto planeOutputY = getPlane(pOutputFrame, RGY_PLANE_Y);
         auto planeOutputA = getPlane(pOutputFrame, RGY_PLANE_A);
-        const auto block_count = getBlockCount(planeOutputY.width, planeOutputY.height, BLOCK_SIZE, ov1, ov2);
+        const auto block_count = getBlockCount(planeOutputY.width + extra.offY, planeOutputY.height + extra.offY, BLOCK_SIZE, ov1, ov2);
         dim3 blockSize(32, 8);
         dim3 gridSize(divCeil(planeOutputY.width, blockSize.x), divCeil(planeOutputY.height, blockSize.y), rgy_csp_has_alpha(pInputFrame->csp) ? 2 : 1);
         kernel_merge<TypePixel, BLOCK_SIZE> << <gridSize, blockSize, 0, stream >> > (
             (char *)planeOutputY.ptr[0], (char *)planeOutputA.ptr[0], planeOutputY.pitch[0],
             (const char *)planeInputY.ptr[0], (const char *)planeInputA.ptr[0], planeInputY.pitch[0],
-            planeOutputY.width, planeOutputY.height, block_count.first, block_count.second, ov1, ov2);
+            planeOutputY.width, planeOutputY.height, block_count.first, block_count.second, ov1, ov2, extra.offY);
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
         if (err != RGY_ERR_NONE) {
@@ -643,13 +687,13 @@ RGY_ERR denoise_merge(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFram
         if (planeOutputU.pitch[0] != planeOutputV.pitch[0]) {
             return RGY_ERR_UNKNOWN;
         }
-        const auto block_count = getBlockCount(planeOutputU.width, planeOutputU.height, BLOCK_SIZE, ov1, ov2);
+        const auto block_count = getBlockCount(planeOutputU.width + extra.offUV, planeOutputU.height + extra.offUV, BLOCK_SIZE, ov1, ov2);
         dim3 blockSize(32, 8);
         dim3 gridSize(divCeil(planeOutputU.width, blockSize.x), divCeil(planeOutputU.height, blockSize.y), 2);
         kernel_merge<TypePixel, BLOCK_SIZE> << <gridSize, blockSize, 0, stream >> > (
             (char *)planeOutputU.ptr[0], (char *)planeOutputV.ptr[0], planeOutputU.pitch[0],
             (const char *)planeInputU.ptr[0], (const char *)planeInputV.ptr[0], planeInputU.pitch[0],
-            planeOutputU.width, planeOutputU.height, block_count.first, block_count.second, ov1, ov2);
+            planeOutputU.width, planeOutputU.height, block_count.first, block_count.second, ov1, ov2, extra.offUV);
         CUDA_DEBUG_SYNC_ERR;
         auto err = err_to_rgy(cudaGetLastError());
         if (err != RGY_ERR_NONE) {

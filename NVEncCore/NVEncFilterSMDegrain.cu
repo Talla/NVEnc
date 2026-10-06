@@ -45,6 +45,10 @@ NVEncFilterSMDegrain::NVEncFilterSMDegrain() :
     m_mcScratch(),
     m_degrainScratch(),
     m_blurScratch(),
+    m_blockTh(),
+    m_nlfLut(),
+    m_scdCount(),
+    m_cachedNlf(),
     m_cachedWidth(0),
     m_cachedHeight(0),
     m_cachedTr(0),
@@ -91,6 +95,14 @@ RGY_ERR NVEncFilterSMDegrain::checkParam(const NVEncFilterParamSMDegrain *prm) {
         chroma != RGY_CHROMAFMT_YUV444) {
         AddMessage(RGY_LOG_ERROR, _T("SMDegrain supports planar YUV (420/422/444) only.\n"));
         return RGY_ERR_UNSUPPORTED;
+    }
+    if (prm->smdegrain.subpel != 1 && prm->smdegrain.subpel != 2 && prm->smdegrain.subpel != 4) {
+        AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, subpel must be 1, 2 or 4 (got %d).\n"), prm->smdegrain.subpel);
+        return RGY_ERR_INVALID_PARAM;
+    }
+    if (prm->smdegrain.thsad_k > 0.0f && prm->smdegrain.thsad_nlf.empty()) {
+        AddMessage(RGY_LOG_ERROR, _T("thsad_k needs thsad_nlf (noise level per brightness).\n"));
+        return RGY_ERR_INVALID_PARAM;
     }
     if ((prm->frameOut.width & 1) || (prm->frameOut.height & 1)) {
         AddMessage(RGY_LOG_ERROR, _T("SMDegrain requires even frame dimensions (got %dx%d).\n"),
@@ -197,6 +209,18 @@ RGY_ERR NVEncFilterSMDegrain::allocateWorkspaces(const NVEncFilterParamSMDegrain
         return sts;
     }
 
+    // Phase 4: per-block thSAD (one int per full-resolution block) and 6 scene-change counters.
+    m_blockTh = std::unique_ptr<CUMemBuf>(new CUMemBuf((size_t)l0_blocks_x * l0_blocks_y * sizeof(int)));
+    if ((sts = m_blockTh->alloc()) != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("failed to allocate block thSAD buffer: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+    m_scdCount = std::unique_ptr<CUMemBuf>(new CUMemBuf(6 * sizeof(int)));
+    if ((sts = m_scdCount->alloc()) != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("failed to allocate scene-change counters: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+
     m_ringSize = newRingSize;
     m_ringIdx = 0;
     m_outputIdx = 0;
@@ -225,6 +249,42 @@ RGY_ERR NVEncFilterSMDegrain::init(shared_ptr<NVEncFilterParam> pParam, shared_p
     }
     if ((sts = allocateWorkspaces(prm.get())) != RGY_ERR_NONE) {
         return sts;
+    }
+    // Phase 4: noise level per brightness for the per-block thSAD (SMD_NLF_BINS sigmas, 8-bit units).
+    if (prm->smdegrain.thsad_k > 0.0f && !prm->smdegrain.thsad_nlf.empty()) {
+        if (!m_nlfLut || m_cachedNlf != prm->smdegrain.thsad_nlf) {
+            const auto &c = prm->smdegrain.thsad_nlf;
+            std::vector<float> lut(smdegrain::SMD_NLF_BINS);
+            for (int b = 0; b < smdegrain::SMD_NLF_BINS; b++) {
+                const float x = ((float)b + 0.5f) / (float)smdegrain::SMD_NLF_BINS;
+                float v = c.back().second;
+                if (x <= c.front().first) {
+                    v = c.front().second;
+                } else {
+                    for (size_t i = 1; i < c.size(); i++) {
+                        if (x <= c[i].first) {
+                            const float t = (x - c[i - 1].first) / (c[i].first - c[i - 1].first);
+                            v = c[i - 1].second + t * (c[i].second - c[i - 1].second);
+                            break;
+                        }
+                    }
+                }
+                lut[b] = v;
+            }
+            m_nlfLut = std::unique_ptr<CUMemBuf>(new CUMemBuf(lut.size() * sizeof(float)));
+            if ((sts = m_nlfLut->alloc()) != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to allocate NLF table: %s.\n"), get_err_mes(sts));
+                return sts;
+            }
+            if ((sts = err_to_rgy(cudaMemcpy(m_nlfLut->ptr, lut.data(), lut.size() * sizeof(float), cudaMemcpyHostToDevice))) != RGY_ERR_NONE) {
+                AddMessage(RGY_LOG_ERROR, _T("failed to copy NLF table: %s.\n"), get_err_mes(sts));
+                return sts;
+            }
+            m_cachedNlf = prm->smdegrain.thsad_nlf;
+        }
+    } else {
+        m_nlfLut.reset();
+        m_cachedNlf.clear();
     }
 
     sts = AllocFrameBuf(prm->frameOut, 1);
@@ -294,6 +354,37 @@ RGY_ERR NVEncFilterSMDegrain::run_filter(const RGYFrameInfo *pInputFrame, RGYFra
     return runDenoiseImpl<uint16_t>(pInputFrame, ppOutputFrames, pOutputFrameNum, stream, pix_max, limit_scaled, thSAD_scaled);
 }
 
+// Phase 4 blend dispatch: the reference count is a template parameter of the kernels.
+template<typename T>
+static cudaError_t blendV2Dispatch(int n, const T* cur, const smdegrain::SMDBlendRefs<T>& refs,
+    int bx, int by, int w, int h, int pitch, int thSAD, const int* blockTh, int weights,
+    const int* scd, int scdLimit, int limit, int pixMax, T* out, cudaStream_t stream) {
+    switch (n) {
+    case 1: return smdegrain::launch_temporal_blend_v2<T, 1, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    case 2: return smdegrain::launch_temporal_blend_v2<T, 2, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    case 3: return smdegrain::launch_temporal_blend_v2<T, 3, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    case 4: return smdegrain::launch_temporal_blend_v2<T, 4, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    case 5: return smdegrain::launch_temporal_blend_v2<T, 5, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    case 6: return smdegrain::launch_temporal_blend_v2<T, 6, SMD_BLOCK_SIZE>(cur, refs, bx, by, w, h, pitch, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, out, stream);
+    default: return cudaErrorInvalidValue;
+    }
+}
+
+template<typename T>
+static cudaError_t blendChromaDispatch(int n, const smdegrain::SMDChromaPlanes<T>& planes, const smdegrain::SMDBlendRefs<T>& refs,
+    int bx, int by, int cw, int ch, int sx, int sy, int thSAD, const int* blockTh, int weights,
+    const int* scd, int scdLimit, int limit, int pixMax, cudaStream_t stream) {
+    switch (n) {
+    case 1: return smdegrain::launch_temporal_blend_chroma<T, 1, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    case 2: return smdegrain::launch_temporal_blend_chroma<T, 2, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    case 3: return smdegrain::launch_temporal_blend_chroma<T, 3, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    case 4: return smdegrain::launch_temporal_blend_chroma<T, 4, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    case 5: return smdegrain::launch_temporal_blend_chroma<T, 5, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    case 6: return smdegrain::launch_temporal_blend_chroma<T, 6, SMD_BLOCK_SIZE>(planes, refs, bx, by, cw, ch, sx, sy, thSAD, blockTh, weights, scd, scdLimit, limit, pixMax, stream);
+    default: return cudaErrorInvalidValue;
+    }
+}
+
 template<typename T>
 RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames,
@@ -359,6 +450,21 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     const T* d_cur_l0 = (const T*)curY.ptr[0];
     T* d_cur_l1 = (T*)m_l1Buf[cur_slot]->ptr;
 
+    // Refs available for this frame. Refs are indexed [0, total_refs):
+    //   i < past_avail       → past frame emit_k - (i + 1)
+    //   i >= past_avail      → future frame emit_k + (i - past_avail + 1)
+    const int past_avail = std::min(emit_k, tr);
+    const int fut_avail  = std::min(m_ringIdx - 1 - emit_k, tr);
+    const int total_refs = past_avail + fut_avail;
+
+    // Phase 4 options (all off by default → legacy kernels, unchanged output).
+    const auto &sp = prm->smdegrain;
+    const bool doChroma = sp.chroma;
+    const int subpel = sp.subpel;
+    const bool useBlockTh = sp.thsad_k > 0.0f && m_nlfLut;
+    const bool useScd = sp.thSCD1 < 9999;
+    const bool useV2 = doChroma || sp.weights != 0 || subpel > 1 || useBlockTh || useScd;
+
     // UV passthrough from the FRAME BEING PROCESSED — not from the latest input.
     // During bidirectional operation emit_k is tr frames behind m_ringIdx, and during
     // flush pInputFrame is null, so UV must come from the ring slot.
@@ -366,10 +472,12 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     auto procV = getPlane(&procFrame->frame, RGY_PLANE_V);
     auto outU = getPlane(ppOutputFrames[0], RGY_PLANE_U);
     auto outV = getPlane(ppOutputFrames[0], RGY_PLANE_V);
-    sts = copyPlaneAsync(&outU, &procU, stream);
-    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: U passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
-    sts = copyPlaneAsync(&outV, &procV, stream);
-    if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: V passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
+    if (!doChroma || total_refs == 0) {
+        sts = copyPlaneAsync(&outU, &procU, stream);
+        if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: U passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
+        sts = copyPlaneAsync(&outV, &procV, stream);
+        if (sts != RGY_ERR_NONE) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain: V passthrough failed: %s.\n"), get_err_mes(sts)); return sts; }
+    }
 
     auto outY = getPlane(ppOutputFrames[0], RGY_PLANE_Y);
     T* d_out = (T*)outY.ptr[0];
@@ -378,13 +486,6 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
         AddMessage(RGY_LOG_ERROR, _T("SMDegrain output pitch mismatch (y0=%d, out=%d).\n"), pitch_y0_bytes, out_pitch_bytes);
         return RGY_ERR_UNSUPPORTED;
     }
-
-    // Determine how many refs we have. Refs are indexed [0, total_refs):
-    //   i < past_avail       → past frame emit_k - (i + 1)
-    //   i >= past_avail      → future frame emit_k + (i - past_avail + 1)
-    const int past_avail = std::min(emit_k, tr);
-    const int fut_avail  = std::min(m_ringIdx - 1 - emit_k, tr);
-    const int total_refs = past_avail + fut_avail;
 
     ppOutputFrames[0]->picstruct = procFrame->frame.picstruct;
 
@@ -400,7 +501,17 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     // ME + MC per ref
     smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
     const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
+    const int l1_blocks_y = m_l1Height / SMD_BLOCK_SIZE;
     const int l0_blocks_x = width / SMD_BLOCK_SIZE;
+    const int l0_blocks_y = height / SMD_BLOCK_SIZE;
+    // thSCD1 is given in 8-bit scale per 8x8 block, like thSAD.
+    const int thscd1_scaled = (int)((int64_t)sp.thSCD1 * (pix_max + 1) / 256);
+    const int scd_limit = (l0_blocks_x * l0_blocks_y * sp.thSCD2) / 256;
+    int* d_scd = useScd ? (int*)m_scdCount->ptr : nullptr;
+    if (useScd) {
+        cudaError_t cerr = cudaMemsetAsync(d_scd, 0, 6 * sizeof(int), stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain scd reset failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+    }
     for (int i = 0; i < total_refs; i++) {
         int ref_frame_idx;
         if (i < past_avail) {
@@ -421,18 +532,46 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
         cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, T>(
             d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels,
-            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_i, stream);
+            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, l1_blocks_y, d_fine_i, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        if (subpel > 1) {
+            // vectors become 1/subpel px from here on
+            cerr = smdegrain::launch_me_subpel<SMD_BLOCK_SIZE, T>(
+                d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels, subpel, d_fine_i, stream);
+            if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain subpel ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        }
+        if (useScd) {
+            cerr = smdegrain::launch_count_scd(d_fine_i, l0_blocks_x * l0_blocks_y, thscd1_scaled, d_scd + i, stream);
+            if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain scd count i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        }
 
         auto mcY = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_Y);
         if (mcY.pitch[0] != pitch_y0_bytes) {
             AddMessage(RGY_LOG_ERROR, _T("SMDegrain pitch mismatch at i=%d (mc=%d, y0=%d).\n"), i, mcY.pitch[0], pitch_y0_bytes);
             return RGY_ERR_UNSUPPORTED;
         }
-        cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, T>(
-            d_ref_l0, d_fine_i, width, height, pitch_y0_pixels, l0_blocks_x,
-            (T*)mcY.ptr[0], stream);
+        if (subpel > 1) {
+            cerr = smdegrain::launch_motion_compensate_subpel<SMD_BLOCK_SIZE, T>(
+                d_ref_l0, d_fine_i, width, height, pitch_y0_pixels, l0_blocks_x, l0_blocks_y, subpel, pix_max,
+                (T*)mcY.ptr[0], stream);
+        } else {
+            cerr = smdegrain::launch_motion_compensate<SMD_BLOCK_SIZE, T>(
+                d_ref_l0, d_fine_i, width, height, pitch_y0_pixels, l0_blocks_x,
+                (T*)mcY.ptr[0], stream);
+        }
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain MC i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        if (doChroma) {
+            auto refU = getPlane(&refRing->frame, RGY_PLANE_U);
+            auto refV = getPlane(&refRing->frame, RGY_PLANE_V);
+            auto mcU = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_U);
+            auto mcV = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_V);
+            const int csx = width / refU.width, csy = height / refU.height;
+            cerr = smdegrain::launch_motion_compensate_chroma<SMD_BLOCK_SIZE, T>(
+                (const T*)refU.ptr[0], (const T*)refV.ptr[0], refU.pitch[0] / (int)sizeof(T),
+                (T*)mcU.ptr[0], (T*)mcV.ptr[0], mcU.pitch[0] / (int)sizeof(T),
+                refU.width, refU.height, csx, csy, d_fine_i, l0_blocks_x, l0_blocks_y, subpel, pix_max, stream);
+            if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain chroma MC i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
+        }
     }
 
     // Gather ref pointer arrays for the blend kernel (max 6 slots).
@@ -454,6 +593,47 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     }
 
     cudaError_t cerr = cudaSuccess;
+    if (useV2) {
+        int* d_block_th = nullptr;
+        if (useBlockTh) {
+            d_block_th = (int*)m_blockTh->ptr;
+            cerr = smdegrain::launch_block_thsad<SMD_BLOCK_SIZE, T>(d_cur_l0, width, height, pitch_y0_pixels,
+                l0_blocks_x, l0_blocks_y, (const float*)m_nlfLut->ptr, sp.thsad_k, pix_max, d_block_th, stream);
+            if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain block thSAD failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+        }
+        smdegrain::SMDBlendRefs<T> refs = {};
+        for (int i = 0; i < total_refs; i++) {
+            refs.mc[i] = mc[i];
+            refs.mv[i] = mv[i];
+        }
+        cerr = blendV2Dispatch<T>(total_refs, d_cur_l0, refs, l0_blocks_x, l0_blocks_y, width, height, pitch_y0_pixels,
+            thSAD_scaled, d_block_th, sp.weights, d_scd, scd_limit, limit_scaled, pix_max, d_blend_target, stream);
+        if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain blend v2 failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+        if (doChroma) {
+            smdegrain::SMDChromaPlanes<T> cp = {};
+            cp.cur[0] = (const T*)procU.ptr[0];
+            cp.cur[1] = (const T*)procV.ptr[0];
+            cp.out[0] = (T*)outU.ptr[0];
+            cp.out[1] = (T*)outV.ptr[0];
+            cp.cur_pitch = procU.pitch[0] / (int)sizeof(T);
+            cp.out_pitch = outU.pitch[0] / (int)sizeof(T);
+            for (int i = 0; i < total_refs; i++) {
+                auto mcU = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_U);
+                auto mcV = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_V);
+                cp.mc[i][0] = (const T*)mcU.ptr[0];
+                cp.mc[i][1] = (const T*)mcV.ptr[0];
+                cp.mc_pitch = mcU.pitch[0] / (int)sizeof(T);
+            }
+            if (procU.pitch[0] != procV.pitch[0] || outU.pitch[0] != outV.pitch[0]) {
+                AddMessage(RGY_LOG_ERROR, _T("SMDegrain: U/V pitch mismatch.\n"));
+                return RGY_ERR_UNSUPPORTED;
+            }
+            cerr = blendChromaDispatch<T>(total_refs, cp, refs, l0_blocks_x, l0_blocks_y, procU.width, procU.height,
+                width / procU.width, height / procU.height, thSAD_scaled, d_block_th, sp.weights, d_scd, scd_limit,
+                limit_scaled, pix_max, stream);
+            if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain chroma blend failed: %d.\n"), (int)cerr); return RGY_ERR_CUDA; }
+        }
+    } else
     switch (total_refs) {
         case 1:
             cerr = smdegrain::launch_temporal_blend_nref<T, 1, SMD_BLOCK_SIZE>(
@@ -540,6 +720,10 @@ void NVEncFilterSMDegrain::close() {
     m_mcScratch.clear();
     m_degrainScratch.reset();
     m_blurScratch.reset();
+    m_blockTh.reset();
+    m_nlfLut.reset();
+    m_scdCount.reset();
+    m_cachedNlf.clear();
     m_ringSize = 0;
     m_ringIdx = 0;
     m_outputIdx = 0;

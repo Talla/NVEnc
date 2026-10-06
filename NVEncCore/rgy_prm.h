@@ -396,6 +396,7 @@ static const int   FILTER_DEFAULT_SMDEGRAIN_LIMIT       = 160;  // max per-pixel
 static const bool  FILTER_DEFAULT_SMDEGRAIN_CONTRASHARP = true; // restore micro-detail after temporal average
 static const int   FILTER_DEFAULT_SMDEGRAIN_THSCD1      = 9999; // scene-change SAD threshold (9999 ~= disabled, matches all media_processor presets)
 static const int   FILTER_DEFAULT_SMDEGRAIN_SEARCH      = 3;    // search mode (MVTools-style; 3 = exhaustive log-diamond)
+static const int   FILTER_DEFAULT_SMDEGRAIN_THSCD2      = 130;  // MVTools default: > 130/256 of blocks over thSCD1 = scene change
 
 static const int   FILTER_DEFAULT_MSMOOTH_STRENGTH = 3;
 static const float FILTER_DEFAULT_MSMOOTH_THRESHOLD = 15.0f;
@@ -2067,6 +2068,12 @@ struct VppDenoiseFFT3D {
     VppFpPrecision precision;
     std::vector<std::pair<float, float>> sigma_curve; // (normalized_freq, sigma) pairs; empty -> use scalar sigma. dfttest-style slocation.
     bool sigma_curve_dfttest; // true when given as slocation=: dfttest units/mapping (power, per-dimension product)
+    // Phase 4 quick wins (denoise-lab project). Defaults reproduce the previous behaviour exactly.
+    int grid_offset;          // block grid offset in luma px (0 = legacy grid; e.g. 8 moves the 16-px hop off the codec grid)
+    float amount_c;           // amount for chroma planes; < 0 = same as amount
+    std::vector<std::pair<float, float>> level_scale_y;  // (block luma level 0..1, sigma factor) – noise vs brightness, luma
+    std::vector<std::pair<float, float>> level_scale_cb; // same for Cb (factor relative to the slocation curve)
+    std::vector<std::pair<float, float>> level_scale_cr; // same for Cr
     VppDenoiseFFT3D();
     bool operator==(const VppDenoiseFFT3D &x) const;
     bool operator!=(const VppDenoiseFFT3D &x) const;
@@ -2081,8 +2088,15 @@ struct VppSMDegrain {
     int  thSAD;        // block SAD cut-off for rejecting a ref block
     int  limit;        // max per-pixel delta after bounded average (0..255)
     bool contrasharp;  // run contra-sharp pass after averaging
-    int  thSCD1;       // scene-change SAD threshold (currently a stub; all media_processor presets set ~9999)
-    int  search;       // search mode (MVTools-style; all media_processor presets use 3)
+    int  thSCD1;       // scene-change block SAD threshold (8-bit scale, per 8x8 block); >= 9999 disables scene-change detection
+    int  search;       // search mode (MVTools-style; all media_processor presets use 3) – not used by the GPU port
+    // Phase 4 quick wins (denoise-lab project). Defaults reproduce the previous behaviour exactly.
+    int  thSCD2;       // share of blocks over thSCD1 (0..255, of 256) that marks a reference as across a scene cut
+    bool chroma;       // motion-compensate and blend Cb/Cr with the luma vectors (false = chroma passthrough)
+    int  weights;      // 0 = binary accept/reject per block (legacy), 1 = SAD-weighted (MVTools-style)
+    int  subpel;       // motion precision: 1 (integer, legacy), 2 (half-pel), 4 (quarter-pel); 6-tap Lanczos interpolation
+    float thsad_k;     // > 0: per-block thSAD = thsad_k * expected SAD of pure noise at the block's luma level (needs thsad_nlf)
+    std::vector<std::pair<float, float>> thsad_nlf; // (luma level 0..1, noise sigma in 8-bit code values)
 
     VppSMDegrain();
     bool operator==(const VppSMDegrain &x) const;

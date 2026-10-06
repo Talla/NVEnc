@@ -85,7 +85,8 @@ NVEncFilterDenoiseFFT3D::NVEncFilterDenoiseFFT3D() :
     m_sigmaTableDfttest(false),
     m_sigmaTableBlockSize(0),
     m_sigmaTableTemporalCount(0),
-    m_sigmaTableBitDepth(0) {
+    m_sigmaTableBitDepth(0),
+    m_levelTable() {
     m_name = _T("denoise-fft");
 }
 
@@ -139,7 +140,35 @@ RGY_ERR NVEncFilterDenoiseFFT3D::checkParam(const NVEncFilterParamDenoiseFFT3D *
         AddMessage(RGY_LOG_ERROR, _T("Invalid precision.\n"));
         return RGY_ERR_INVALID_PARAM;
     }
+    if (prm->fft3d.grid_offset < 0 || prm->fft3d.grid_offset >= prm->fft3d.block_size) {
+        AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, grid_offset must be 0 - block_size-1.\n"));
+        return RGY_ERR_INVALID_PARAM;
+    }
+    if (prm->fft3d.amount_c > 1.0f) {
+        AddMessage(RGY_LOG_ERROR, _T("Invalid parameter, amount_c must be 0 - 1.\n"));
+        return RGY_ERR_INVALID_PARAM;
+    }
     return RGY_ERR_NONE;
+}
+
+// Chroma grid offset for a luma offset (ceil for 4:2:0 so the luma blocks still fit the
+// buffers sized from the chroma block count).
+static int chromaGridOffset(const RGY_CSP csp, const int offY) {
+    return (RGY_CSP_CHROMA_FORMAT[csp] == RGY_CHROMAFMT_YUV420) ? (offY + 1) / 2 : offY;
+}
+
+// Piecewise-linear lookup with constant extrapolation.
+static float interpCurve(const std::vector<std::pair<float, float>> &curve, const float x) {
+    if (curve.empty()) return 1.0f;
+    if (x <= curve.front().first) return curve.front().second;
+    if (x >= curve.back().first) return curve.back().second;
+    for (size_t i = 1; i < curve.size(); i++) {
+        if (x <= curve[i].first) {
+            const float t = (x - curve[i - 1].first) / (curve[i].first - curve[i - 1].first);
+            return curve[i - 1].second + t * (curve[i].second - curve[i - 1].second);
+        }
+    }
+    return curve.back().second;
 }
 
 RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, shared_ptr<RGYLog> pPrintMes) {
@@ -170,13 +199,15 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         || prm->fft3d.temporal != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.temporal
         || prm->fft3d.tbsize != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.tbsize
         || prm->fft3d.precision != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.precision
+        || prm->fft3d.grid_offset != std::dynamic_pointer_cast<NVEncFilterParamDenoiseFFT3D>(m_param)->fft3d.grid_offset
         || cmpFrameInfoCspResolution(&m_param->frameOut, &prm->frameOut)) {
         m_ov1 = (int)(prm->fft3d.block_size * 0.5 * prm->fft3d.overlap + 0.5);
         m_ov2 = (int)(prm->fft3d.block_size * 0.5 * (prm->fft3d.overlap + prm->fft3d.overlap2) + 0.5) - m_ov1;
 
         //より小さいUVに合わせてブロック数を計算し、そこから確保するメモリを決める
         auto planeUV = getPlane(&prm->frameOut, RGY_PLANE_U);
-        const auto blocksUV = getBlockCount(planeUV.width, planeUV.height, prm->fft3d.block_size, m_ov1, m_ov2);
+        const int offUV = chromaGridOffset(prm->frameOut.csp, prm->fft3d.grid_offset);
+        const auto blocksUV = getBlockCount(planeUV.width + offUV, planeUV.height + offUV, prm->fft3d.block_size, m_ov1, m_ov2);
         const int complexSize = (prm->fft3d.precision == VppFpPrecision::VPP_FP_PRECISION_FP32) ? 8 : 4;
 
         RGY_CSP fft_csp = RGY_CSP_NA;
@@ -397,6 +428,29 @@ RGY_ERR NVEncFilterDenoiseFFT3D::init(shared_ptr<NVEncFilterParam> pParam, share
         }
     }
 
+    // Per-brightness sigma factors (Phase 4): [Y, U, V][FFT3D_LEVEL_BINS] of factor^2 (noise power).
+    if (prm->fft3d.level_scale_y.empty() && prm->fft3d.level_scale_cb.empty() && prm->fft3d.level_scale_cr.empty()) {
+        m_levelTable.reset();
+    } else {
+        std::vector<float> lut(3 * FFT3D_LEVEL_BINS);
+        const std::vector<std::pair<float, float>> *curves[3] = { &prm->fft3d.level_scale_y, &prm->fft3d.level_scale_cb, &prm->fft3d.level_scale_cr };
+        for (int p = 0; p < 3; p++) {
+            for (int b = 0; b < FFT3D_LEVEL_BINS; b++) {
+                const float f = interpCurve(*curves[p], ((float)b + 0.5f) / (float)FFT3D_LEVEL_BINS);
+                lut[p * FFT3D_LEVEL_BINS + b] = f * f;
+            }
+        }
+        m_levelTable = std::unique_ptr<CUMemBuf>(new CUMemBuf(lut.size() * sizeof(float)));
+        if ((sts = m_levelTable->alloc()) != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("failed to allocate memory for level LUT: %s.\n"), get_err_mes(sts));
+            return sts;
+        }
+        if ((sts = err_to_rgy(cudaMemcpy(m_levelTable->ptr, lut.data(), lut.size() * sizeof(float), cudaMemcpyHostToDevice))) != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("failed to copy memory for level LUT: %s.\n"), get_err_mes(sts));
+            return sts;
+        }
+    }
+
     setFilterInfo(pParam->print());
     m_pathThrough = FILTER_PATHTHROUGH_ALL;
     if (prm->fft3d.effectiveTbsize() > 1) {
@@ -434,6 +488,28 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
     const int tbsize = prm->fft3d.effectiveTbsize();
     const int lag = tbsize / 2; // 0 for tbsize=1, 1 for tbsize=3, 2 for tbsize=5
 
+    FFT3DExtra extra;
+    extra.offY = prm->fft3d.grid_offset;
+    extra.offUV = chromaGridOffset(prm->frameOut.csp, prm->fft3d.grid_offset);
+    extra.limitUV = (prm->fft3d.amount_c >= 0.0f) ? 1.0f - prm->fft3d.amount_c : -1.0f;
+    extra.levelLut = m_levelTable ? (const float *)m_levelTable->ptr : nullptr;
+    if (extra.levelLut) {
+        const auto blocksY = getBlockCount(prm->frameOut.width + extra.offY, prm->frameOut.height + extra.offY, prm->fft3d.block_size, m_ov1, m_ov2);
+        extra.lumaBlockCountX = blocksY.first;
+        extra.lumaBlockCountY = blocksY.second;
+        const bool is420 = RGY_CSP_CHROMA_FORMAT[prm->frameOut.csp] == RGY_CHROMAFMT_YUV420;
+        extra.chromaRatioX = is420 ? 2 : 1;
+        extra.chromaRatioY = is420 ? 2 : 1;
+    }
+    // lumaDC is set per call below to the current frame's FFT buffer.
+    auto setLumaDC = [&extra](CUFrameBuf *fftCurBuf) {
+        if (extra.levelLut && fftCurBuf) {
+            const auto planeY = getPlane(&fftCurBuf->frame, RGY_PLANE_Y);
+            extra.lumaDC = (const char *)planeY.ptr[0];
+            extra.lumaDCPitch = planeY.pitch[0];
+        }
+    };
+
     const bool finalOutput = pInputFrame->ptr[0] == nullptr;
     if (finalOutput) {
         if (tbsize == 1 || m_nFrameIdx >= m_bufIdx) {
@@ -460,7 +536,7 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
             AddMessage(RGY_LOG_ERROR, _T("failed to get fft buffer.\n"));
             return RGY_ERR_NULL_PTR;
         }
-        sts = denosieFunc->fft()(&fftBuf->frame, pInputFrame, m_ov1, m_ov2, (const float *)m_windowBuf->ptr, stream);
+        sts = denosieFunc->fft()(&fftBuf->frame, pInputFrame, m_ov1, m_ov2, (const float *)m_windowBuf->ptr, extra, stream);
         if (sts != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to run fft: %s.\n"), get_err_mes(sts));
             return RGY_ERR_NONE;
@@ -493,12 +569,13 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
             auto fftPrev = m_bufFFT.get(idxP);
             auto fftCur  = m_bufFFT.get(idxC);
             auto fftNext = m_bufFFT.get(idxN);
+            setLumaDC(fftCur);
             sts = denosieFunc->tfft_filter_ifft(1, 3)(&m_filteredBlocks->frame,
                 &fftPrev->frame, &fftCur->frame, &fftNext->frame, nullptr, nullptr,
                 (const float *)m_windowBufInverse->ptr,
                 prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
                 prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
-                sigmaTablePtr, stream);
+                sigmaTablePtr, extra, stream);
             if (sts != RGY_ERR_NONE) {
                 AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(1, 3): %s.\n"), get_err_mes(sts));
                 return RGY_ERR_NONE;
@@ -510,12 +587,13 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
             auto fftCur  = m_bufFFT.get(idxC);
             auto fftNext = m_bufFFT.get(idxN);
             auto fftNN   = m_bufFFT.get(idxNN);
+            setLumaDC(fftCur);
             sts = denosieFunc->tfft_filter_ifft(2, 5)(&m_filteredBlocks->frame,
                 &fftPP->frame, &fftPrev->frame, &fftCur->frame, &fftNext->frame, &fftNN->frame,
                 (const float *)m_windowBufInverse->ptr,
                 prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
                 prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
-                sigmaTablePtr, stream);
+                sigmaTablePtr, extra, stream);
             if (sts != RGY_ERR_NONE) {
                 AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(2, 5): %s.\n"), get_err_mes(sts));
                 return RGY_ERR_NONE;
@@ -525,16 +603,17 @@ RGY_ERR NVEncFilterDenoiseFFT3D::run_filter(const RGYFrameInfo *pInputFrame, RGY
     } else {
         auto fftCur = m_bufFFT.get(m_bufIdx - 1);
         const float *sigmaTablePtr = m_sigmaTable ? (const float *)m_sigmaTable->ptr : nullptr;
+        setLumaDC(fftCur);
         sts = denosieFunc->tfft_filter_ifft(0, 1)(&m_filteredBlocks->frame, &fftCur->frame, nullptr, nullptr, nullptr, nullptr, (const float *)m_windowBufInverse->ptr,
             prm->frameOut.width, prm->frameOut.height, planeUV.width, planeUV.height, m_ov1, m_ov2,
             prm->fft3d.sigma, 1.0f - prm->fft3d.amount, prm->fft3d.method,
-            sigmaTablePtr, stream);
+            sigmaTablePtr, extra, stream);
         if (sts != RGY_ERR_NONE) {
             AddMessage(RGY_LOG_ERROR, _T("failed to run tfft_filter_ifft(0, 1): %s.\n"), get_err_mes(sts));
             return RGY_ERR_NONE;
         }
     }
-    sts = denosieFunc->merge()(ppOutputFrames[0], &m_filteredBlocks->frame, m_ov1, m_ov2, stream);
+    sts = denosieFunc->merge()(ppOutputFrames[0], &m_filteredBlocks->frame, m_ov1, m_ov2, extra, stream);
     if (sts != RGY_ERR_NONE) {
         AddMessage(RGY_LOG_ERROR, _T("failed to run merge: %s.\n"), get_err_mes(sts));
         return RGY_ERR_NONE;
@@ -555,4 +634,5 @@ void NVEncFilterDenoiseFFT3D::close() {
     m_sigmaTableBlockSize = 0;
     m_sigmaTableTemporalCount = 0;
     m_sigmaTableBitDepth = 0;
+    m_levelTable.reset();
 }

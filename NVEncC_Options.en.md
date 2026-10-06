@@ -2592,6 +2592,52 @@ Edge-preserving smoothing filter.
     - auto ... use fp16 if possible (faster)
     - fp32 ... always use fp32
 
+  - tbsize=&lt;int&gt; (fork, default = derived from temporal)
+    Temporal window: 1, 3 or 5 frames. Overrides temporal.
+
+  - slocation=&lt;freq/sigma;...&gt; (fork)
+    dfttest-style noise curve (noise power in 8-bit units vs normalised frequency). Requires fp32.
+
+  - grid_offset=&lt;int&gt; (fork, default = 0)
+    Shift the block grid by this many luma pixels (chroma: half, rounded up, for 4:2:0), so block
+    boundaries and window minima don't fall on the codec's 8/16-px grid. 0 keeps the previous grid.
+
+  - amount_c=&lt;float&gt; (fork, default = same as amount, 0.0 - 1.0)
+    Amount of denoising for the chroma planes.
+
+  - level_scale_y=&lt;level/factor;...&gt;, level_scale_c=..., level_scale_cb=..., level_scale_cr=... (fork)
+    Noise vs brightness. level = block luma level 0..1 (normalised code value), factor = multiplier of
+    the noise sigma (the curve's power is scaled by factor²). Linear interpolation, constant outside.
+    Chroma blocks use the luma level of the co-located luma blocks. level_scale_c sets Cb and Cr.
+
+### --vpp-smdegrain [&lt;param1&gt;=&lt;value1&gt;][,&lt;param2&gt;=&lt;value2&gt;],... (fork)
+
+  Motion-compensated temporal denoise (GPU reimplementation of the SMDegrain function of havsfunc/MVTools).
+
+- **parameters**
+  - tr=&lt;int&gt; (default=2, 1 - 3)
+    Temporal radius; uses tr past and tr future frames (output is delayed by tr frames).
+  - thsad=&lt;int&gt; (default=300)
+    Block SAD (8x8, 8-bit scale) above which a reference block is not used.
+  - limit=&lt;int&gt; (default=160, 0 - 255)
+    Maximum change per pixel (8-bit scale).
+  - contrasharp=&lt;bool&gt; (default=true)
+    Contra-sharpening after the average (luma).
+  - thscd1=&lt;int&gt; (default=9999), thscd2=&lt;int&gt; (default=130, 0 - 255)
+    Scene-change detection (MVTools semantics): a reference with more than thscd2/256 of its blocks over
+    the block SAD thscd1 is not used. thscd1 &gt;= 9999 disables it.
+  - chroma=&lt;bool&gt; (default=false)
+    Motion-compensate and average Cb/Cr with the luma vectors. false passes chroma through unchanged.
+  - weights=&lt;string&gt; (default=binary)
+    - binary ... a reference block is fully used or not at all (SAD &lt;= thsad)
+    - sad ... MVTools weights (thsad² - SAD²) / (thsad² + SAD²)
+  - subpel=&lt;int&gt; (default=1)
+    Motion precision 1, 2 (half-pel) or 4 (quarter-pel); 6-tap Lanczos interpolation.
+  - thsad_k=&lt;float&gt; (default=0 = off), thsad_nlf=&lt;level/sigma;...&gt;
+    Per-block thsad from the noise level at the block's luma level: thsad = thsad_k × 64 × 1.128 × sigma,
+    sigma in 8-bit code values interpolated from thsad_nlf (level 0..1). 1.128·sigma is the mean absolute
+    difference of two independent noise samples.
+
 ### --vpp-knn [&lt;param1&gt;=&lt;value1&gt;][,&lt;param2&gt;=&lt;value2&gt;],...
 Strong noise reduction filter.
 

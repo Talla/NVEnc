@@ -1512,7 +1512,12 @@ VppDenoiseFFT3D::VppDenoiseFFT3D() :
     tbsize(0),
     precision(VppFpPrecision::VPP_FP_PRECISION_AUTO),
     sigma_curve(),
-    sigma_curve_dfttest(false) {
+    sigma_curve_dfttest(false),
+    grid_offset(0),
+    amount_c(-1.0f),
+    level_scale_y(),
+    level_scale_cb(),
+    level_scale_cr() {
 
 }
 
@@ -1528,7 +1533,12 @@ bool VppDenoiseFFT3D::operator==(const VppDenoiseFFT3D &x) const {
         && tbsize == x.tbsize
         && precision == x.precision
         && sigma_curve == x.sigma_curve
-        && sigma_curve_dfttest == x.sigma_curve_dfttest;
+        && sigma_curve_dfttest == x.sigma_curve_dfttest
+        && grid_offset == x.grid_offset
+        && amount_c == x.amount_c
+        && level_scale_y == x.level_scale_y
+        && level_scale_cb == x.level_scale_cb
+        && level_scale_cr == x.level_scale_cr;
 }
 bool VppDenoiseFFT3D::operator!=(const VppDenoiseFFT3D &x) const {
     return !(*this == x);
@@ -1544,6 +1554,19 @@ tstring VppDenoiseFFT3D::print() const {
             str += strsprintf(_T(" %.3f/%.3f"), pt.first, pt.second);
         }
     }
+    if (grid_offset != 0 || amount_c >= 0.0f) {
+        str += strsprintf(_T("\n                         grid_offset %d, amount_c %.2f"), grid_offset, amount_c >= 0.0f ? amount_c : amount);
+    }
+    const std::pair<const TCHAR *, const std::vector<std::pair<float, float>> *> levelCurves[] = {
+        { _T("level_scale_y"), &level_scale_y }, { _T("level_scale_cb"), &level_scale_cb }, { _T("level_scale_cr"), &level_scale_cr } };
+    for (const auto &lc : levelCurves) {
+        if (!lc.second->empty()) {
+            str += strsprintf(_T("\n                         %s:"), lc.first);
+            for (const auto &pt : *lc.second) {
+                str += strsprintf(_T(" %.3f/%.3f"), pt.first, pt.second);
+            }
+        }
+    }
     return str;
 }
 
@@ -1554,7 +1577,13 @@ VppSMDegrain::VppSMDegrain() :
     limit(FILTER_DEFAULT_SMDEGRAIN_LIMIT),
     contrasharp(FILTER_DEFAULT_SMDEGRAIN_CONTRASHARP),
     thSCD1(FILTER_DEFAULT_SMDEGRAIN_THSCD1),
-    search(FILTER_DEFAULT_SMDEGRAIN_SEARCH) {
+    search(FILTER_DEFAULT_SMDEGRAIN_SEARCH),
+    thSCD2(FILTER_DEFAULT_SMDEGRAIN_THSCD2),
+    chroma(false),
+    weights(0),
+    subpel(1),
+    thsad_k(0.0f),
+    thsad_nlf() {
 
 }
 
@@ -1565,15 +1594,31 @@ bool VppSMDegrain::operator==(const VppSMDegrain &x) const {
         && limit == x.limit
         && contrasharp == x.contrasharp
         && thSCD1 == x.thSCD1
-        && search == x.search;
+        && search == x.search
+        && thSCD2 == x.thSCD2
+        && chroma == x.chroma
+        && weights == x.weights
+        && subpel == x.subpel
+        && thsad_k == x.thsad_k
+        && thsad_nlf == x.thsad_nlf;
 }
 bool VppSMDegrain::operator!=(const VppSMDegrain &x) const {
     return !(*this == x);
 }
 
 tstring VppSMDegrain::print() const {
-    return strsprintf(_T("smdegrain: tr %d, thSAD %d, limit %d, contrasharp %s, thSCD1 %d, search %d"),
+    tstring str = strsprintf(_T("smdegrain: tr %d, thSAD %d, limit %d, contrasharp %s, thSCD1 %d, search %d"),
         tr, thSAD, limit, contrasharp ? _T("on") : _T("off"), thSCD1, search);
+    str += strsprintf(_T("\n                         chroma %s, weights %s, subpel %d, scene-change %s"),
+        chroma ? _T("on") : _T("off"), weights ? _T("sad") : _T("binary"), subpel,
+        thSCD1 < 9999 ? strsprintf(_T("thSCD1 %d thSCD2 %d"), thSCD1, thSCD2).c_str() : _T("off"));
+    if (thsad_k > 0.0f && !thsad_nlf.empty()) {
+        str += strsprintf(_T("\n                         thSAD from noise: k %.2f, nlf"), thsad_k);
+        for (const auto &pt : thsad_nlf) {
+            str += strsprintf(_T(" %.3f/%.3f"), pt.first, pt.second);
+        }
+    }
+    return str;
 }
 
 VppMsmooth::VppMsmooth() :

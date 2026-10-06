@@ -50,15 +50,35 @@ static std::pair<int, int> getBlockCount(const int width, const int height, cons
     return std::make_pair(block_count_x, block_count_y);
 }
 
+// Number of level bins of the per-brightness sigma LUT (block luma level 0..1).
+static const int FFT3D_LEVEL_BINS = 64;
+
+// Phase 4 quick wins (denoise-lab project). A default-constructed value reproduces the previous behaviour.
+struct FFT3DExtra {
+    int offY;                   // block grid offset in luma px (0 = legacy grid)
+    int offUV;                  // block grid offset in chroma px
+    float limitUV;              // Wiener gain floor (1 - amount) for chroma; < 0 = same as luma
+    const float *levelLut;      // [3][FFT3D_LEVEL_BINS] sigma power factors for Y, U, V; nullptr = off
+    const char *lumaDC;         // Y plane of the current frame's FFT buffer (block DCs give the chroma blocks' luma level)
+    int lumaDCPitch;
+    int lumaBlockCountX;
+    int lumaBlockCountY;
+    int chromaRatioX;           // luma blocks per chroma block in x (2 for 4:2:0, 1 for 4:4:4)
+    int chromaRatioY;
+    FFT3DExtra() : offY(0), offUV(0), limitUV(-1.0f), levelLut(nullptr), lumaDC(nullptr), lumaDCPitch(0),
+        lumaBlockCountX(0), lumaBlockCountY(0), chromaRatioX(1), chromaRatioY(1) {};
+};
+
 typedef RGY_ERR (*func_fft3d_fft)(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2,
-    const float *ptrBlockWindow, cudaStream_t stream);
+    const float *ptrBlockWindow, const FFT3DExtra extra, cudaStream_t stream);
 typedef RGY_ERR (*func_fft3d_tfft_filter_ifft)(RGYFrameInfo *pOutputFrame,
     const RGYFrameInfo *pInputFrameA, const RGYFrameInfo *pInputFrameB, const RGYFrameInfo *pInputFrameC, const RGYFrameInfo *pInputFrameD, const RGYFrameInfo *pInputFrameE,
     const float *ptrBlockWindowInverse,
     const int widthY, const int heightY, const int widthUV, const int heightUV, const int ov1, const int ov2,
     const float sigma, const float limit, const int filterMethod,
-    const float *sigmaTable, cudaStream_t stream);
-typedef RGY_ERR (*func_fft3d_merge)(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2, cudaStream_t stream);
+    const float *sigmaTable, const FFT3DExtra extra, cudaStream_t stream);
+typedef RGY_ERR (*func_fft3d_merge)(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const int ov1, const int ov2,
+    const FFT3DExtra extra, cudaStream_t stream);
 
 class DenoiseFFT3DBase {
 public:
@@ -109,4 +129,6 @@ protected:
     int m_sigmaTableBlockSize;
     int m_sigmaTableTemporalCount;
     int m_sigmaTableBitDepth;
+    // Per-brightness sigma factors (level_scale_*): [3][FFT3D_LEVEL_BINS] power factors; null when unused.
+    std::unique_ptr<CUMemBuf> m_levelTable;
 };

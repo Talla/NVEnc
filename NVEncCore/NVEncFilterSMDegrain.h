@@ -87,6 +87,13 @@ protected:
     std::unique_ptr<CUFrameBuf> m_degrainScratch;
     std::unique_ptr<CUFrameBuf> m_blurScratch;
 
+    // Phase 4 quick wins (denoise-lab): per-block thSAD from the noise level, its NLF lookup
+    // table, and per-reference scene-change counters. Allocated only when the options are used.
+    std::unique_ptr<CUMemBuf> m_blockTh;
+    std::unique_ptr<CUMemBuf> m_nlfLut;
+    std::unique_ptr<CUMemBuf> m_scdCount;
+    std::vector<std::pair<float, float>> m_cachedNlf;
+
     // Cached param snapshot for reallocation detection.
     int m_cachedWidth;
     int m_cachedHeight;

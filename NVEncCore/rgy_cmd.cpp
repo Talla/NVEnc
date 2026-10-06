@@ -456,6 +456,25 @@ std::vector<CX_DESC> get_libplacebo_only_resize_list() {
 #pragma warning(disable: 4100) //warning C4100: 'argData': 引数は関数の本体部で 1 度も参照されません。
 #pragma warning(disable: 4127) //warning C4127: 条件式が定数です。
 
+// Parses "x/y;x/y;..." with 0 <= x <= 1 strictly increasing and 0 <= y <= ymax (denoise-lab Phase 4 level curves).
+static bool parse_xy_curve(const tstring &str, std::vector<std::pair<float, float>> &curve, const float ymax) {
+    curve.clear();
+    for (const auto &pair_str : split(str, _T(";"))) {
+        auto slash = pair_str.find_first_of(_T("/"));
+        if (slash == std::string::npos) return false;
+        try {
+            const float x = std::stof(pair_str.substr(0, slash));
+            const float y = std::stof(pair_str.substr(slash + 1));
+            if (x < 0.0f || x > 1.0f || y < 0.0f || y > ymax) return false;
+            if (!curve.empty() && x <= curve.back().first) return false;
+            curve.emplace_back(x, y);
+        } catch (...) {
+            return false;
+        }
+    }
+    return curve.size() >= 1;
+}
+
 int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int &i, int nArgNum, RGYParamVpp *vpp, sArgsData *argData) {
     if (IS_OPTION("vpp-order") && ENABLE_VPP_ORDER) {
         i++;
@@ -3009,7 +3028,8 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve", "slocation"};
+            "sigma", "amount", "block_size", "overlap",/*"overlap2",*/ "method", "temporal", "tbsize", "prec", "sigma_curve", "slocation",
+            "grid_offset", "amount_c", "level_scale_y", "level_scale_c", "level_scale_cb", "level_scale_cr"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3059,6 +3079,50 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                     }
                     vpp->fft3d.sigma_curve = std::move(curve);
                     vpp->fft3d.sigma_curve_dfttest = (param_arg == _T("slocation"));
+                    continue;
+                }
+                if (param_arg == _T("grid_offset")) {
+                    try {
+                        const int v = std::stoi(param_val);
+                        if (v < 0 || v > 31) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->fft3d.grid_offset = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("amount_c")) {
+                    try {
+                        vpp->fft3d.amount_c = std::stof(param_val);
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("level_scale_y") || param_arg == _T("level_scale_c")
+                    || param_arg == _T("level_scale_cb") || param_arg == _T("level_scale_cr")) {
+                    // Noise vs brightness: "level/factor;..." with level = block luma 0..1 (normalised code
+                    // value) and factor = sigma multiplier on the slocation curve (power scales by factor^2).
+                    std::vector<std::pair<float, float>> curve;
+                    if (!parse_xy_curve(param_val, curve, 100.0f)) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    if (param_arg == _T("level_scale_y")) {
+                        vpp->fft3d.level_scale_y = curve;
+                    } else if (param_arg == _T("level_scale_cb")) {
+                        vpp->fft3d.level_scale_cb = curve;
+                    } else if (param_arg == _T("level_scale_cr")) {
+                        vpp->fft3d.level_scale_cr = curve;
+                    } else {
+                        vpp->fft3d.level_scale_cb = curve;
+                        vpp->fft3d.level_scale_cr = curve;
+                    }
                     continue;
                 }
                 if (param_arg == _T("amount")) {
@@ -3159,7 +3223,8 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         i++;
         const auto paramList = std::vector<std::string>{
-            "tr", "thsad", "limit", "contrasharp", "thscd1", "search"};
+            "tr", "thsad", "limit", "contrasharp", "thscd1", "search",
+            "thscd2", "chroma", "weights", "subpel", "thsad_k", "thsad_nlf"};
         for (const auto &param : split(strInput[i], _T(","))) {
             auto pos = param.find_first_of(_T("="));
             if (pos != std::string::npos) {
@@ -3239,6 +3304,79 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                         print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
                         return 1;
                     }
+                    continue;
+                }
+                if (param_arg == _T("thscd2")) {
+                    try {
+                        const int v = std::stoi(param_val);
+                        if (v < 0 || v > 255) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->smdegrain.thSCD2 = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("chroma")) {
+                    bool b = false;
+                    if (cmd_string_to_bool(&b, param_val) == 0) {
+                        vpp->smdegrain.chroma = b;
+                    } else {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("weights")) {
+                    if (param_val == _T("binary")) {
+                        vpp->smdegrain.weights = 0;
+                    } else if (param_val == _T("sad")) {
+                        vpp->smdegrain.weights = 1;
+                    } else {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("subpel")) {
+                    try {
+                        const int v = std::stoi(param_val);
+                        if (v != 1 && v != 2 && v != 4) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->smdegrain.subpel = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("thsad_k")) {
+                    try {
+                        const float v = std::stof(param_val);
+                        if (v < 0.0f || v > 100.0f) {
+                            print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                            return 1;
+                        }
+                        vpp->smdegrain.thsad_k = v;
+                    } catch (...) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    continue;
+                }
+                if (param_arg == _T("thsad_nlf")) {
+                    // Noise level function: "level/sigma;..." (level 0..1 normalised code value, sigma in 8-bit code values).
+                    std::vector<std::pair<float, float>> curve;
+                    if (!parse_xy_curve(param_val, curve, 255.0f)) {
+                        print_cmd_error_invalid_value(tstring(option_name) + _T(" ") + param_arg + _T("="), param_val);
+                        return 1;
+                    }
+                    vpp->smdegrain.thsad_nlf = curve;
                     continue;
                 }
                 print_cmd_error_unknown_opt_param(option_name, param_arg, paramList);
@@ -10052,7 +10190,11 @@ tstring gen_cmd_help_vpp() {
         _T("                              0 (default), 1\n")
         _T("      temporal=<int>        Enable temporal filtering (default=%d)\n")
         _T("      prec=<string>         Select calculation precision.\n")
-        _T("                              auto (default), fp16, fp32\n"),
+        _T("                              auto (default), fp16, fp32\n")
+        _T("      grid_offset=<int>     shift the block grid by <int> luma px (default 0)\n")
+        _T("      amount_c=<float>      amount for chroma planes (default: same as amount)\n")
+        _T("      level_scale_y=<l/f;...>  sigma factor vs block luma level 0..1 (luma)\n")
+        _T("      level_scale_c=<l/f;...>  same for Cb and Cr (or level_scale_cb / level_scale_cr)\n"),
         FILTER_DEFAULT_DENOISE_FFT3D_SIGMA, FILTER_DEFAULT_DENOISE_FFT3D_AMOUNT, FILTER_DEFAULT_DENOISE_FFT3D_BLOCK_SIZE,
         FILTER_DEFAULT_DENOISE_FFT3D_OVERLAP, /* FILTER_DEFAULT_DENOISE_FFT3D_OVERLAP2,*/ FILTER_DEFAULT_DENOISE_FFT3D_TEMPORAL);
 #endif

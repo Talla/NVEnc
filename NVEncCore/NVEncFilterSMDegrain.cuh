@@ -159,6 +159,7 @@ __global__ void kernel_me_refine_around_hint(
     const int search_radius,
     const MVBlock* __restrict__ hints,
     const int coarse_blocks_x,
+    const int coarse_blocks_y,
     MVBlock* __restrict__ out_blocks
 ) {
     const int bx = blockIdx.x;
@@ -167,8 +168,10 @@ __global__ void kernel_me_refine_around_hint(
     const int y0 = by * BLOCK_SIZE;
     const int blocks_x = gridDim.x;
 
-    const int coarse_bx = bx / 2;
-    const int coarse_by = by / 2;
+    // Clamp: when (height/2) is not a multiple of BLOCK_SIZE (1080 lines: 540/8 = 67.5) the last
+    // full-resolution block row maps to a coarse row that does not exist.
+    const int coarse_bx = min(bx / 2, coarse_blocks_x - 1);
+    const int coarse_by = min(by / 2, coarse_blocks_y - 1);
     const MVBlock hint = hints[coarse_by * coarse_blocks_x + coarse_bx];
     const int hint_mvx = (int)hint.mvx * 2;
     const int hint_mvy = (int)hint.mvy * 2;
@@ -240,7 +243,7 @@ static inline cudaError_t launch_me_refine_around_hint(
     const T* d_ref, const T* d_cur,
     int width, int height, int pitch_pixels,
     int search_radius,
-    const MVBlock* d_hints, int coarse_blocks_x,
+    const MVBlock* d_hints, int coarse_blocks_x, int coarse_blocks_y,
     MVBlock* d_out_blocks,
     cudaStream_t stream = 0
 ) {
@@ -250,7 +253,7 @@ static inline cudaError_t launch_me_refine_around_hint(
     const dim3 block(64, 1, 1);
     kernel_me_refine_around_hint<BLOCK_SIZE, T><<<grid, block, 0, stream>>>(
         d_ref, d_cur, width, height, pitch_pixels, search_radius,
-        d_hints, coarse_blocks_x, d_out_blocks);
+        d_hints, coarse_blocks_x, coarse_blocks_y, d_out_blocks);
     return cudaGetLastError();
 }
 
@@ -521,6 +524,364 @@ static inline cudaError_t launch_contrasharp(
     const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
     kernel_contrasharp<T><<<grid, block, 0, stream>>>(
         d_degrain, d_source, d_blurred, width, height, pitch_pixels, pix_max, d_out);
+    return cudaGetLastError();
+}
+
+
+// ==========================================================================================
+// Phase 4 quick wins (denoise-lab project, project-plan.md Phase 4). All opt-in; with the
+// defaults the filter uses the kernels above and its output is unchanged.
+//
+//   * sub-pel motion (half / quarter pel) with a 6-tap Lanczos-3 interpolator      (W8)
+//   * chroma motion compensation with the luma vectors                             (W3)
+//   * per-block thSAD scaled by the noise level at the block's brightness          (W6)
+//   * SAD-weighted blend instead of binary accept/reject (MVTools weights)         (W11)
+//   * scene-change detection (thSCD1 / thSCD2, MVTools semantics)
+//
+// Motion vectors keep the MVBlock layout. With subpel > 1 they are stored in 1/subpel luma px.
+// ==========================================================================================
+
+__device__ __forceinline__ float lanczos3(float t) {
+    t = fabsf(t);
+    if (t < 1e-6f) return 1.0f;
+    if (t >= 3.0f) return 0.0f;
+    const float pt = 3.14159265358979f * t;
+    return 3.0f * __sinf(pt) * __sinf(pt * (1.0f / 3.0f)) / (pt * pt);
+}
+
+// Taps at integer offsets -2..+3 around floor(x), fx = x - floor(x) in [0,1). Normalised to sum 1.
+__device__ __forceinline__ void lanczos6_weights(const float fx, float w[6]) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 6; k++) {
+        w[k] = lanczos3((float)(k - 2) - fx);
+        sum += w[k];
+    }
+    const float inv = 1.0f / sum;
+    #pragma unroll
+    for (int k = 0; k < 6; k++) w[k] *= inv;
+}
+
+// Sample a plane at a fractional position (edge-clamped). Exact copy at integer positions.
+template<typename T>
+__device__ __forceinline__ float sample_lanczos6(const T* __restrict__ src, const int width, const int height,
+                                                 const int pitch_pixels, const float x, const float y) {
+    const float flx = floorf(x), fly = floorf(y);
+    const int ix = (int)flx, iy = (int)fly;
+    const float fx = x - flx, fy = y - fly;
+    if (fx == 0.0f && fy == 0.0f) {
+        const int cx = min(max(ix, 0), width - 1);
+        const int cy = min(max(iy, 0), height - 1);
+        return (float)src[cy * pitch_pixels + cx];
+    }
+    float wx[6], wy[6];
+    lanczos6_weights(fx, wx);
+    lanczos6_weights(fy, wy);
+    float acc = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 6; j++) {
+        const int yy = min(max(iy - 2 + j, 0), height - 1);
+        const T* row = src + yy * pitch_pixels;
+        float r = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 6; i++) {
+            const int xx = min(max(ix - 2 + i, 0), width - 1);
+            r += wx[i] * (float)row[xx];
+        }
+        acc += wy[j] * r;
+    }
+    return acc;
+}
+
+// Block-wide float sum for blockDim.x == BLOCK_SIZE*BLOCK_SIZE (64 for 8x8: two warps).
+template<int NTHREADS>
+__device__ __forceinline__ float block_sum(float v, float* s_warp) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) s_warp[warp] = v;
+    __syncthreads();
+    float total = 0.0f;
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int i = 0; i < (NTHREADS + 31) / 32; i++) total += s_warp[i];
+        s_warp[0] = total;
+    }
+    __syncthreads();
+    total = s_warp[0];
+    __syncthreads();
+    return total;
+}
+
+// Refine integer vectors (px) to 1/subpel px around the integer result: a half-pel ring, then
+// (subpel == 4) a quarter-pel ring. In-place; output vectors are in 1/subpel px units.
+template<int BLOCK_SIZE, typename T>
+__global__ void kernel_me_subpel(
+    const T* __restrict__ ref, const T* __restrict__ cur,
+    const int width, const int height, const int pitch_pixels,
+    const int subpel, MVBlock* __restrict__ mvs
+) {
+    constexpr int NT = BLOCK_SIZE * BLOCK_SIZE;
+    __shared__ float s_warp[(NT + 31) / 32];
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int blocks_x = gridDim.x;
+    const int tx = threadIdx.x % BLOCK_SIZE, ty = threadIdx.x / BLOCK_SIZE;
+    const int x = bx * BLOCK_SIZE + tx, y = by * BLOCK_SIZE + ty;
+    MVBlock mv = mvs[by * blocks_x + bx];
+    int best_x = mv.mvx * subpel, best_y = mv.mvy * subpel;
+    const float c = (float)cur[min(y, height - 1) * pitch_pixels + min(x, width - 1)];
+    const float inv = 1.0f / (float)subpel;
+    float best = block_sum<NT>(fabsf(c - sample_lanczos6(ref, width, height, pitch_pixels,
+                                                           x + best_x * inv, y + best_y * inv)), s_warp);
+    for (int step = subpel / 2; step >= 1; step /= 2) {
+        const int cx = best_x, cy = best_y;
+        for (int k = 0; k < 9; k++) {
+            if (k == 4) continue;
+            const int dx = (k % 3 - 1) * step, dy = (k / 3 - 1) * step;
+            const float sad = block_sum<NT>(fabsf(c - sample_lanczos6(ref, width, height, pitch_pixels,
+                                                                        x + (cx + dx) * inv, y + (cy + dy) * inv)), s_warp);
+            if (sad < best) { best = sad; best_x = cx + dx; best_y = cy + dy; }
+        }
+    }
+    if (threadIdx.x == 0) {
+        mv.mvx = (int16_t)best_x;
+        mv.mvy = (int16_t)best_y;
+        mv.sad = (int32_t)(best + 0.5f);
+        mvs[by * blocks_x + bx] = mv;
+    }
+}
+
+template<int BLOCK_SIZE, typename T>
+static inline cudaError_t launch_me_subpel(const T* d_ref, const T* d_cur, int width, int height, int pitch_pixels,
+                                           int subpel, MVBlock* d_mvs, cudaStream_t stream = 0) {
+    const dim3 grid(width / BLOCK_SIZE, height / BLOCK_SIZE, 1);
+    kernel_me_subpel<BLOCK_SIZE, T><<<grid, BLOCK_SIZE * BLOCK_SIZE, 0, stream>>>(
+        d_ref, d_cur, width, height, pitch_pixels, subpel, d_mvs);
+    return cudaGetLastError();
+}
+
+// Luma MC at 1/subpel precision (subpel 1 still works: exact copies).
+template<int BLOCK_SIZE, typename T>
+__global__ void kernel_motion_compensate_subpel(
+    const T* __restrict__ ref, const MVBlock* __restrict__ mvs,
+    const int width, const int height, const int pitch_pixels,
+    const int mv_blocks_x, const int mv_blocks_y, const int subpel, const int pix_max,
+    T* __restrict__ out
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int bx = min(x / BLOCK_SIZE, mv_blocks_x - 1);
+    const int by = min(y / BLOCK_SIZE, mv_blocks_y - 1);
+    const MVBlock mv = mvs[by * mv_blocks_x + bx];
+    const float inv = 1.0f / (float)subpel;
+    const float v = sample_lanczos6(ref, width, height, pitch_pixels, x + mv.mvx * inv, y + mv.mvy * inv);
+    out[y * pitch_pixels + x] = (T)min(max((int)(v + 0.5f), 0), pix_max);
+}
+
+template<int BLOCK_SIZE, typename T>
+static inline cudaError_t launch_motion_compensate_subpel(const T* d_ref, const MVBlock* d_mvs, int width, int height,
+    int pitch_pixels, int mv_blocks_x, int mv_blocks_y, int subpel, int pix_max, T* d_out, cudaStream_t stream = 0) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
+    kernel_motion_compensate_subpel<BLOCK_SIZE, T><<<grid, block, 0, stream>>>(
+        d_ref, d_mvs, width, height, pitch_pixels, mv_blocks_x, mv_blocks_y, subpel, pix_max, d_out);
+    return cudaGetLastError();
+}
+
+// Chroma MC with the luma vectors. (sx, sy) = chroma subsampling (2,2) 4:2:0, (2,1) 4:2:2, (1,1) 4:4:4.
+// A luma vector of v/subpel px is v/(subpel*s) chroma px, so odd luma vectors land between chroma
+// samples and are interpolated. gridDim.z selects U (0) or V (1).
+template<int BLOCK_SIZE, typename T>
+__global__ void kernel_motion_compensate_chroma(
+    const T* __restrict__ refU, const T* __restrict__ refV, const int ref_pitch,
+    T* __restrict__ outU, T* __restrict__ outV, const int out_pitch,
+    const int cwidth, const int cheight, const int sx, const int sy,
+    const MVBlock* __restrict__ mvs, const int mv_blocks_x, const int mv_blocks_y,
+    const int subpel, const int pix_max
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= cwidth || y >= cheight) return;
+    const T* ref = (blockIdx.z == 0) ? refU : refV;
+    T* out = (blockIdx.z == 0) ? outU : outV;
+    const int bx = min((x * sx) / BLOCK_SIZE, mv_blocks_x - 1);
+    const int by = min((y * sy) / BLOCK_SIZE, mv_blocks_y - 1);
+    const MVBlock mv = mvs[by * mv_blocks_x + bx];
+    const float v = sample_lanczos6(ref, cwidth, cheight, ref_pitch,
+                                    x + (float)mv.mvx / (float)(subpel * sx), y + (float)mv.mvy / (float)(subpel * sy));
+    out[y * out_pitch + x] = (T)min(max((int)(v + 0.5f), 0), pix_max);
+}
+
+template<int BLOCK_SIZE, typename T>
+static inline cudaError_t launch_motion_compensate_chroma(const T* d_refU, const T* d_refV, int ref_pitch,
+    T* d_outU, T* d_outV, int out_pitch, int cwidth, int cheight, int sx, int sy,
+    const MVBlock* d_mvs, int mv_blocks_x, int mv_blocks_y, int subpel, int pix_max, cudaStream_t stream = 0) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((cwidth + 15) / 16, (cheight + 15) / 16, 2);
+    kernel_motion_compensate_chroma<BLOCK_SIZE, T><<<grid, block, 0, stream>>>(
+        d_refU, d_refV, ref_pitch, d_outU, d_outV, out_pitch, cwidth, cheight, sx, sy,
+        d_mvs, mv_blocks_x, mv_blocks_y, subpel, pix_max);
+    return cudaGetLastError();
+}
+
+// Per-block thSAD from the noise level at the block's brightness:
+//   E|n1 - n2| for independent Gaussian noise of std sigma = sqrt(2) * sigma * sqrt(2/pi) = 1.128 sigma,
+//   so a pure-noise block SAD is about BLOCK_SIZE^2 * 1.128 * sigma; thSAD = k * that.
+// nlf_lut: SMD_NLF_BINS sigmas in 8-bit code values over the normalised level 0..1.
+static constexpr int SMD_NLF_BINS = 64;
+template<int BLOCK_SIZE, typename T>
+__global__ void kernel_block_thsad(
+    const T* __restrict__ cur, const int width, const int height, const int pitch_pixels,
+    const int blocks_x, const int blocks_y, const float* __restrict__ nlf_lut,
+    const float k, const int pix_max, int* __restrict__ out
+) {
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx >= blocks_x || by >= blocks_y) return;
+    float sum = 0.0f;
+    for (int j = 0; j < BLOCK_SIZE; j++) {
+        const T* row = cur + min(by * BLOCK_SIZE + j, height - 1) * pitch_pixels;
+        for (int i = 0; i < BLOCK_SIZE; i++) sum += (float)row[min(bx * BLOCK_SIZE + i, width - 1)];
+    }
+    const float level = sum / (float)(BLOCK_SIZE * BLOCK_SIZE) / (float)pix_max;
+    const int bin = min(max((int)(level * SMD_NLF_BINS), 0), SMD_NLF_BINS - 1);
+    const float sigma = nlf_lut[bin] * ((float)pix_max / 255.0f);
+    out[by * blocks_x + bx] = (int)(k * (float)(BLOCK_SIZE * BLOCK_SIZE) * 1.1284f * sigma + 0.5f);
+}
+
+template<int BLOCK_SIZE, typename T>
+static inline cudaError_t launch_block_thsad(const T* d_cur, int width, int height, int pitch_pixels,
+    int blocks_x, int blocks_y, const float* d_nlf, float k, int pix_max, int* d_out, cudaStream_t stream = 0) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((blocks_x + 15) / 16, (blocks_y + 15) / 16, 1);
+    kernel_block_thsad<BLOCK_SIZE, T><<<grid, block, 0, stream>>>(
+        d_cur, width, height, pitch_pixels, blocks_x, blocks_y, d_nlf, k, pix_max, d_out);
+    return cudaGetLastError();
+}
+
+// Scene-change test (MVTools): count blocks whose SAD exceeds thSCD1. A reference with more than
+// thSCD2/256 of its blocks over the threshold lies across a cut and is left out entirely.
+__global__ void kernel_count_scd(const MVBlock* __restrict__ mvs, const int n_blocks, const int thscd1,
+                                 int* __restrict__ count) {
+    int local = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_blocks; i += gridDim.x * blockDim.x) {
+        local += (mvs[i].sad > thscd1) ? 1 : 0;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) local += __shfl_down_sync(0xffffffff, local, o);
+    if ((threadIdx.x & 31) == 0 && local) atomicAdd(count, local);
+}
+
+static inline cudaError_t launch_count_scd(const MVBlock* d_mvs, int n_blocks, int thscd1, int* d_count,
+                                           cudaStream_t stream = 0) {
+    kernel_count_scd<<<64, 256, 0, stream>>>(d_mvs, n_blocks, thscd1, d_count);
+    return cudaGetLastError();
+}
+
+template<typename T>
+struct SMDBlendRefs {
+    const T* mc[6];
+    const MVBlock* mv[6];
+};
+
+// Weight of one reference block (MVTools DegrainWeight): binary, or (th² - s²) / (th² + s²).
+__device__ __forceinline__ float smd_ref_weight(const int sad, const int th, const int weights) {
+    if (sad > th) return 0.0f;
+    if (weights == 0) return 1.0f;
+    const float t2 = (float)th * (float)th, s2 = (float)sad * (float)sad;
+    return (t2 - s2) / fmaxf(t2 + s2, 1.0f);
+}
+
+// Luma blend with optional per-block thSAD, SAD weights and scene-change exclusion.
+template<typename T, int NREFS, int BLOCK_SIZE>
+__global__ void kernel_temporal_blend_v2(
+    const T* __restrict__ cur, const SMDBlendRefs<T> refs,
+    const int mv_blocks_x, const int mv_blocks_y,
+    const int width, const int height, const int pitch_pixels,
+    const int thSAD, const int* __restrict__ block_th, const int weights,
+    const int* __restrict__ scd_count, const int scd_limit,
+    const int limit_scaled, const int pix_max, T* __restrict__ out
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int blk = min(y / BLOCK_SIZE, mv_blocks_y - 1) * mv_blocks_x + min(x / BLOCK_SIZE, mv_blocks_x - 1);
+    const int th = block_th ? block_th[blk] : thSAD;
+    const int px = y * pitch_pixels + x;
+    const float c = (float)cur[px];
+    float sum = c, wsum = 1.0f;
+    #pragma unroll
+    for (int i = 0; i < NREFS; i++) {
+        if (scd_count && scd_count[i] > scd_limit) continue;
+        const float w = smd_ref_weight(refs.mv[i][blk].sad, th, weights);
+        if (w > 0.0f) { sum += w * (float)refs.mc[i][px]; wsum += w; }
+    }
+    float delta = sum / wsum - c;
+    delta = fminf(fmaxf(delta, -(float)limit_scaled), (float)limit_scaled);
+    out[px] = (T)min(max((int)(c + delta + 0.5f), 0), pix_max);
+}
+
+template<typename T, int NREFS, int BLOCK_SIZE>
+static inline cudaError_t launch_temporal_blend_v2(const T* d_cur, const SMDBlendRefs<T>& refs,
+    int mv_blocks_x, int mv_blocks_y, int width, int height, int pitch_pixels,
+    int thSAD, const int* d_block_th, int weights, const int* d_scd_count, int scd_limit,
+    int limit_scaled, int pix_max, T* d_out, cudaStream_t stream = 0) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16, 1);
+    kernel_temporal_blend_v2<T, NREFS, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+        d_cur, refs, mv_blocks_x, mv_blocks_y, width, height, pitch_pixels,
+        thSAD, d_block_th, weights, d_scd_count, scd_limit, limit_scaled, pix_max, d_out);
+    return cudaGetLastError();
+}
+
+// Chroma blend: same decisions as luma (block SAD of the co-located luma block), applied to Cb/Cr.
+template<typename T>
+struct SMDChromaPlanes {
+    const T* cur[2];        // U, V of the frame being processed
+    const T* mc[6][2];      // motion-compensated U, V per reference
+    T* out[2];
+    int cur_pitch, mc_pitch, out_pitch;
+};
+
+template<typename T, int NREFS, int BLOCK_SIZE>
+__global__ void kernel_temporal_blend_chroma(
+    const SMDChromaPlanes<T> planes, const SMDBlendRefs<T> refs,
+    const int mv_blocks_x, const int mv_blocks_y,
+    const int cwidth, const int cheight, const int sx, const int sy,
+    const int thSAD, const int* __restrict__ block_th, const int weights,
+    const int* __restrict__ scd_count, const int scd_limit,
+    const int limit_scaled, const int pix_max
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int p = blockIdx.z;
+    if (x >= cwidth || y >= cheight) return;
+    const int blk = min((y * sy) / BLOCK_SIZE, mv_blocks_y - 1) * mv_blocks_x + min((x * sx) / BLOCK_SIZE, mv_blocks_x - 1);
+    const int th = block_th ? block_th[blk] : thSAD;
+    const float c = (float)planes.cur[p][y * planes.cur_pitch + x];
+    float sum = c, wsum = 1.0f;
+    #pragma unroll
+    for (int i = 0; i < NREFS; i++) {
+        if (scd_count && scd_count[i] > scd_limit) continue;
+        const float w = smd_ref_weight(refs.mv[i][blk].sad, th, weights);
+        if (w > 0.0f) { sum += w * (float)planes.mc[i][p][y * planes.mc_pitch + x]; wsum += w; }
+    }
+    float delta = sum / wsum - c;
+    delta = fminf(fmaxf(delta, -(float)limit_scaled), (float)limit_scaled);
+    planes.out[p][y * planes.out_pitch + x] = (T)min(max((int)(c + delta + 0.5f), 0), pix_max);
+}
+
+template<typename T, int NREFS, int BLOCK_SIZE>
+static inline cudaError_t launch_temporal_blend_chroma(const SMDChromaPlanes<T>& planes, const SMDBlendRefs<T>& refs,
+    int mv_blocks_x, int mv_blocks_y, int cwidth, int cheight, int sx, int sy,
+    int thSAD, const int* d_block_th, int weights, const int* d_scd_count, int scd_limit,
+    int limit_scaled, int pix_max, cudaStream_t stream = 0) {
+    const dim3 block(16, 16, 1);
+    const dim3 grid((cwidth + 15) / 16, (cheight + 15) / 16, 2);
+    kernel_temporal_blend_chroma<T, NREFS, BLOCK_SIZE><<<grid, block, 0, stream>>>(
+        planes, refs, mv_blocks_x, mv_blocks_y, cwidth, cheight, sx, sy,
+        thSAD, d_block_th, weights, d_scd_count, scd_limit, limit_scaled, pix_max);
     return cudaGetLastError();
 }
 
