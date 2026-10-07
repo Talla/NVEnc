@@ -259,7 +259,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -304,7 +304,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -349,7 +349,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -393,7 +393,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -438,7 +438,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -483,7 +483,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
     <CudaLink>
       <GPUDebugInfo>true</GPUDebugInfo>
@@ -534,7 +534,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -579,7 +579,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelStatic|Win32'">
@@ -626,7 +626,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNVDLL|Win32'">
@@ -673,7 +673,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelStatic|x64'">
@@ -720,7 +720,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNVDLL|x64'">
@@ -767,7 +767,7 @@
     <CudaLink />
     <PreBuildEvent>
       <Command>@rem rev-gen stubbed: rgy_rev.h is maintained manually for this fork build.
-@if not exist rgy_rev.h (echo #pragma once^&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
+@if not exist rgy_rev.h (echo #pragma once&amp; echo #define ENCODER_REV "1") &gt; rgy_rev.h</Command>
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
