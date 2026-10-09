@@ -159,6 +159,7 @@ __global__ void kernel_me_refine_around_hint(
     const int search_radius,
     const MVBlock* __restrict__ hints,
     const int coarse_blocks_x,
+    const int coarse_blocks_y,
     MVBlock* __restrict__ out_blocks
 ) {
     const int bx = blockIdx.x;
@@ -167,8 +168,10 @@ __global__ void kernel_me_refine_around_hint(
     const int y0 = by * BLOCK_SIZE;
     const int blocks_x = gridDim.x;
 
-    const int coarse_bx = bx / 2;
-    const int coarse_by = by / 2;
+    // Clamp: when (height/2) is not a multiple of BLOCK_SIZE (1080 lines: 540/8 = 67.5) the last
+    // full-resolution block row maps to a coarse row that does not exist.
+    const int coarse_bx = min(bx / 2, coarse_blocks_x - 1);
+    const int coarse_by = min(by / 2, coarse_blocks_y - 1);
     const MVBlock hint = hints[coarse_by * coarse_blocks_x + coarse_bx];
     const int hint_mvx = (int)hint.mvx * 2;
     const int hint_mvy = (int)hint.mvy * 2;
@@ -240,7 +243,7 @@ static inline cudaError_t launch_me_refine_around_hint(
     const T* d_ref, const T* d_cur,
     int width, int height, int pitch_pixels,
     int search_radius,
-    const MVBlock* d_hints, int coarse_blocks_x,
+    const MVBlock* d_hints, int coarse_blocks_x, int coarse_blocks_y,
     MVBlock* d_out_blocks,
     cudaStream_t stream = 0
 ) {
@@ -250,7 +253,7 @@ static inline cudaError_t launch_me_refine_around_hint(
     const dim3 block(64, 1, 1);
     kernel_me_refine_around_hint<BLOCK_SIZE, T><<<grid, block, 0, stream>>>(
         d_ref, d_cur, width, height, pitch_pixels, search_radius,
-        d_hints, coarse_blocks_x, d_out_blocks);
+        d_hints, coarse_blocks_x, coarse_blocks_y, d_out_blocks);
     return cudaGetLastError();
 }
 

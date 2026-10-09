@@ -400,6 +400,7 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
     // ME + MC per ref
     smdegrain::MVBlock* d_coarse = (smdegrain::MVBlock*)m_coarseMVs->ptr;
     const int l1_blocks_x = m_l1Width / SMD_BLOCK_SIZE;
+    const int l1_blocks_y = m_l1Height / SMD_BLOCK_SIZE;
     const int l0_blocks_x = width / SMD_BLOCK_SIZE;
     for (int i = 0; i < total_refs; i++) {
         int ref_frame_idx;
@@ -421,7 +422,7 @@ RGY_ERR NVEncFilterSMDegrain::runDenoiseImpl(
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain coarse ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
         cerr = smdegrain::launch_me_refine_around_hint<SMD_BLOCK_SIZE, T>(
             d_ref_l0, d_cur_l0, width, height, pitch_y0_pixels,
-            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, d_fine_i, stream);
+            SMD_REFINE_RADIUS, d_coarse, l1_blocks_x, l1_blocks_y, d_fine_i, stream);
         if (cerr != cudaSuccess) { AddMessage(RGY_LOG_ERROR, _T("SMDegrain refine ME i=%d failed: %d.\n"), i, (int)cerr); return RGY_ERR_CUDA; }
 
         auto mcY = getPlane(&m_mcScratch[i]->frame, RGY_PLANE_Y);
