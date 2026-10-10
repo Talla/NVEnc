@@ -498,7 +498,7 @@ __global__ void kernel_tfft_filter_ifft(
                 const int dst_x = global_bx * BLOCK_SIZE + thWorker;
                 const int dst_y = global_by * BLOCK_SIZE + y;
                 TypePixel *ptr_dst = (TypePixel *)(ptrDst + dst_y * dstPitch + dst_x * sizeof(TypePixel));
-                ptr_dst[0] = (TypePixel)clamp(stmp[local_bx][y][thWorker].realf() * winFuncInvX * ptrBlockWindowInverse[y] * ((float)((1 << bit_depth) - 1)), 0.0f, (1 << bit_depth) - 1e-6f);
+                ptr_dst[0] = (TypePixel)clamp(stmp[local_bx][y][thWorker].realf() * winFuncInvX * ptrBlockWindowInverse[y] * ((float)((1 << bit_depth) - 1)), 0.0f, (float)((1 << bit_depth) - 1));
             }
         }
     }
@@ -511,7 +511,7 @@ __global__ void kernel_tfft_filter_ifft(
             const complex<TypeComplex> *ptr_src = (const complex<TypeComplex> *)(ptrSrcA + dst_y * srcPitch + dst_x * sizeof(complex<TypeComplex>));
             TypePixel *ptr_dst = (TypePixel *)(ptrDst + dst_y * dstPitch + dst_x * sizeof(TypePixel));
 
-            ptr_dst[0] = (TypePixel)clamp(ptr_src[0].v.x * (float)((1 << bit_depth) - 1), 0.0f, (1 << bit_depth) - 1e-6f);
+            ptr_dst[0] = (TypePixel)clamp(ptr_src[0].v.x * (float)((1 << bit_depth) - 1), 0.0f, (float)((1 << bit_depth) - 1));
         }
     }
 #endif
