@@ -80,6 +80,7 @@
 #include "NVEncFilterSmooth.h"
 #include "NVEncFilterDenoiseFFT3D.h"
 #include "NVEncFilterSMDegrain.h"
+#include "NVEncFilterT2.h"
 #include "NVEncFilterMsmooth.h"
 #include "NVEncFilterNvvfx.h"
 #include "NVEncFilterNGX.h"
@@ -494,7 +495,7 @@ RGY_ERR NVEncCore::InitInput(InEncodeVideoParam *inputParam, DeviceCodecCsp& HWD
 
     //入力モジュールが、エンコーダに返すべき色空間をセット
     const bool bOutputHighBitDepth = encodeIsHighBitDepth(inputParam);
-    if (inputParam->lossless
+    if (inputParam->lossless || inputParam->vpp.t2.enable
         || (RGY_CSP_CHROMA_FORMAT[inputParam->outputCsp] == RGY_CHROMAFMT_RGB || RGY_CSP_CHROMA_FORMAT[inputParam->outputCsp] == RGY_CHROMAFMT_RGB_PACKED)
         || rgy_csp_has_alpha(inputParam->outputCsp)
         || inputParam->vpp.colorspace.enable) {
@@ -1617,6 +1618,7 @@ bool NVEncCore::enableCuvidResize(const InEncodeVideoParam *inputParam) const {
             || inputParam->vpp.pmd.enable
             || inputParam->vpp.dct.enable
             || inputParam->vpp.smooth.enable
+            || inputParam->vpp.t2.enable
             || inputParam->vpp.fft3d.enable
             || inputParam->vpp.msmooth.enable
             || inputParam->vppnv.nvvfxDenoise.enable
@@ -2968,6 +2970,7 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     inputFrame.height = inputParam->input.srcHeight;
     inputFrame.csp = inputParam->input.csp;
     inputFrame.picstruct = inputParam->input.picstruct;
+    if(inputParam->vpp.t2.enable)inputFrame.bitdepth=inputParam->input.bitdepth;
     const int croppedWidth = inputFrame.width - inputParam->input.crop.e.left - inputParam->input.crop.e.right;
     const int croppedHeight = inputFrame.height - inputParam->input.crop.e.bottom - inputParam->input.crop.e.up;
     if (!cropRequired) {
@@ -3054,6 +3057,16 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     const auto resize = std::make_pair(resizeWidth, resizeHeight);
 
     std::vector<std::unique_ptr<NVEncFilter>> vppCUDAFilters;
+    // T2 consumes the original native sampling/code domain before colorspace/crop/resize.
+    // All subsequent filters retain their established layout negotiation.
+    if(inputParam->vpp.t2.enable) {
+        if(RGY_CSP_BIT_DEPTH[GetEncoderCSP(inputParam)] < 10) {
+            PrintMes(RGY_LOG_ERROR,_T("T2 requires >=10-bit output; use --output-depth 10.\n"));
+            return RGY_ERR_INVALID_PARAM;
+        }
+        auto err=AddFilterCUDA(vppCUDAFilters,inputFrame,VppType::CL_T2,inputParam,inputCrop,resize,VuiFiltered);
+        if(err!=RGY_ERR_NONE)return err;
+    }
     const auto encCsp = GetEncoderCSP(inputParam);
     auto filterCsp = encCsp;
     switch (filterCsp) {
@@ -3065,6 +3078,7 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     case RGY_CSP_P010A: filterCsp = RGY_CSP_YUVA420_16; break;
     default: break;
     }
+    if(inputParam->vpp.t2.enable && filterPipeline.empty() && inputFrame.csp==encCsp) filterCsp=encCsp;
     if (inputParam->vpp.afs.enable && RGY_CSP_CHROMA_FORMAT[inputFrame.csp] == RGY_CHROMAFMT_YUV444) {
         filterCsp = (RGY_CSP_BIT_DEPTH[inputFrame.csp] > 8) ? RGY_CSP_YUV444_16 : RGY_CSP_YUV444;
     }
@@ -3655,6 +3669,17 @@ RGY_ERR NVEncCore::AddFilterCUDA(std::vector<std::unique_ptr<NVEncFilter>>& cufi
         inputFrame = param->frameOut;
         m_encFps = param->baseFps;
         return RGY_ERR_NONE;
+    }
+    if (vppType == VppType::CL_T2) {
+        unique_ptr<NVEncFilter> filter(new NVEncFilterT2());
+        shared_ptr<NVEncFilterParamT2> param(new NVEncFilterParamT2());
+        param->t2 = inputParam->vpp.t2;
+        param->frameIn = inputFrame; param->frameOut = inputFrame;
+        param->baseFps = m_encFps; param->bOutOverwrite = false;
+        NVEncCtxAutoLock(cxtlock(m_dev->vidCtxLock()));
+        auto sts = filter->init(param,m_pLog); if(sts != RGY_ERR_NONE) return sts;
+        m_pLastFilterParam=param; inputFrame=param->frameOut;
+        cufilters.push_back(std::move(filter)); return RGY_ERR_NONE;
     }
     //SMDegrain motion-compensated temporal denoise (nvenc-smdegrain port)
     if (vppType == VppType::CL_SMDEGRAIN) {

@@ -96,6 +96,7 @@ static const auto VPPTYPE_TO_STR = make_array<std::pair<VppType, tstring>>(
     std::make_pair(VppType::CL_DENOISE_DCT,          _T("denoise-dct")),
     std::make_pair(VppType::CL_DENOISE_SMOOTH,       _T("smooth")),
     std::make_pair(VppType::CL_DENOISE_FFT3D,        _T("fft3d")),
+    std::make_pair(VppType::CL_T2,                   _T("t2")),
     std::make_pair(VppType::CL_SMDEGRAIN,            _T("smdegrain")),
     std::make_pair(VppType::CL_MSMOOTH,              _T("msmooth")),
     std::make_pair(VppType::CL_SUBBURN,              _T("subburn")),
@@ -2166,6 +2167,7 @@ RGYParamVpp::RGYParamVpp() :
     smooth(),
     fft3d(),
     smdegrain(),
+    t2(),
     msmooth(),
     subburn(),
     libplacebo_shader(),
@@ -2207,6 +2209,7 @@ bool RGYParamVpp::operator==(const RGYParamVpp& x) const {
         && smooth == x.smooth
         && fft3d == x.fft3d
         && smdegrain == x.smdegrain
+        && t2 == x.t2
         && msmooth == x.msmooth
         && subburn == x.subburn
         && unsharp == x.unsharp

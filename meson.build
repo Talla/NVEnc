@@ -764,6 +764,7 @@ nvenccore_sources = files(
   'NVEncCore/NVEncFilterCurves.cpp',
   'NVEncCore/NVEncFilterCustom.cpp',
   'NVEncCore/NVEncFilterDelogo.cpp',
+  'NVEncCore/NVEncFilterT2.cpp',
   'NVEncCore/NVEncFilterDenoiseFFT3D.cpp',
   'NVEncCore/NVEncFilterDenoiseGauss.cpp',
   'NVEncCore/NVEncFilterLibplacebo.cpp',
@@ -973,6 +974,14 @@ foreach arg : get_option('cpp_args')
 endforeach
 cuda_args += cuda_include_args
 
+# MCWiener uses the validated integer warp-reduction launchers (SM86+),
+# without changing the architecture/fast-math policy of other filters.
+t2_native_lib = static_library('mcwiener_native',
+  'NVEncCore/t2/t2_native.cu',
+  cuda_args: ['-gencode=arch=compute_86,code=compute_86', '--fmad=false', '--cudart=static', '-std=c++17'] + cuda_include_args,
+  include_directories: common_include_dirs,
+)
+
 # ==============================================================================
 # 依存関係まとめ
 # ==============================================================================
@@ -981,6 +990,7 @@ all_deps = [
   dl_dep,
   cuda_dep,
   cuda_driver_dep,
+  cpp.find_library('cufft', dirs: npp_search_dirs, required: true),
   npp_deps,
   rt_dep,
 ] + ffmpeg_deps
@@ -1039,7 +1049,7 @@ executable('nvencc',
   cuda_args: cuda_args,
   include_directories: common_include_dirs,
   dependencies: all_deps,
-  link_with: simd_libs,
+  link_with: simd_libs + [t2_native_lib],
   install: true,
 )
 

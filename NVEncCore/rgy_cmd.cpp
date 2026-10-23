@@ -25,11 +25,13 @@
 //
 // --------------------------------------------------------------------------------------------
 
+ #include <set>
 #include <set>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
 #include "rgy_util.h"
 #include "rgy_avutil.h"
 #include "rgy_prm.h"
@@ -3148,6 +3150,31 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
                 return 1;
             }
         }
+        return 0;
+    }
+    if ((IS_OPTION("vpp-mcwiener") || IS_OPTION("vpp-t2")) && ENCODER_NVENC) {
+        vpp->t2.enable = true;
+        if (i + 1 >= nArgNum || strInput[i + 1][0] == _T('-')) {
+            print_cmd_error_invalid_value(option_name, _T("mode,profile,pp,iso are required")); return 1;
+        }
+        ++i;
+        std::set<tstring> seen;
+        for (const auto& param : split(strInput[i], _T(","))) {
+            auto pos = param.find(_T('='));
+            if (pos == tstring::npos) { print_cmd_error_invalid_value(option_name,param); return 1; }
+            auto key = tolowercase(param.substr(0,pos)), val = param.substr(pos+1);
+            if (val.empty() || !seen.insert(key).second) { print_cmd_error_invalid_value(option_name,param); return 1; }
+            if (key == _T("mode")) { if(val!=_T("plain") && val!=_T("box") && val!=_T("full")){print_cmd_error_invalid_value(option_name,param);return 1;} vpp->t2.mode=val; }
+            else if(key==_T("profile")) vpp->t2.profile=val;
+            else if(key==_T("pp")) vpp->t2.pp=val;
+            else if(key==_T("iso")) vpp->t2.iso=val;
+            else if(key==_T("strength")) {
+                try {std::string numeric=tchar_to_string(val);char* end=nullptr;double c=std::strtod(numeric.c_str(),&end);if(end!=numeric.c_str()+numeric.size() || !std::isfinite(c) || c<0.0)throw std::invalid_argument("strength");vpp->t2.strength=c;}
+                catch(const std::exception&) {print_cmd_error_invalid_value(option_name,param);return 1;}
+            }
+            else { print_cmd_error_invalid_value(option_name,param); return 1; }
+        }
+        if(!seen.count(_T("mode")) || !seen.count(_T("profile")) || !seen.count(_T("pp")) || !seen.count(_T("iso"))) {print_cmd_error_invalid_value(option_name,_T("mode,profile,pp,iso required")); return 1;}
         return 0;
     }
     if (IS_OPTION("vpp-smdegrain") && ENABLE_VPP_FILTER_SMDEGRAIN) {
@@ -8254,6 +8281,10 @@ tstring gen_cmd(const RGYParamVpp *param, const RGYParamVpp *defaultPrm, bool sa
             cmd << _T(" --vpp-smooth");
         }
     }
+    if (param->t2.enable) {
+        cmd << _T(" --vpp-mcwiener \"mode=") << param->t2.mode << _T(",profile=") << param->t2.profile
+            << _T(",pp=") << param->t2.pp << _T(",iso=") << param->t2.iso << _T(",strength=") << std::setprecision(17) << param->t2.strength << _T("\"");
+    }
     if (param->fft3d != defaultPrm->fft3d) {
         tmp.str(tstring());
         if (!param->fft3d.enable && save_disabled_prm) {
@@ -10038,6 +10069,10 @@ tstring gen_cmd_help_vpp() {
 #endif
 #if ENABLE_VPP_FILTER_FFT3D
     str += strsprintf(_T("\n")
+        _T("   --vpp-mcwiener mode=<plain|box|full>,profile=<path>,pp=<key>,iso=<entry>[,strength=<float>]\n")
+        _T("     strength: exact lab c, finite >=0, default1; larger admits more temporal support.\n")
+        _T("     strength=0 is not bypass: Wiener/S1 remain; fixed variance multiplier8.\n")
+        _T("     MCWiener (alias --vpp-t2); extended NLF/PSD/temporal profile required; progressive >=10-bit YUV.\n")
         _T("   --vpp-fft3d [<param1>=<value>][,<param2>=<value>][...]\n")
         _T("     enable fft based denoise filter.\n")
         _T("    params\n")

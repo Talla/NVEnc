@@ -164,6 +164,7 @@ enum class VppType : int {
     CL_DENOISE_SMOOTH,
     CL_DENOISE_FFT3D,
     CL_SMDEGRAIN,
+    CL_T2,
     CL_MSMOOTH,
 
     CL_LIBPLACEBO_SHADER,
@@ -2075,6 +2076,15 @@ struct VppDenoiseFFT3D {
     int effectiveTbsize() const { return (tbsize > 0) ? tbsize : (temporal ? 3 : 1); }
 };
 
+struct VppT2 {
+    bool enable = false;
+    tstring mode = _T("box"), profile, pp, iso;
+    double strength = 1.0; // Exact lab c: temporal disagreement-variance coefficient.
+    bool operator==(const VppT2& x) const { return enable==x.enable && mode==x.mode && profile==x.profile && pp==x.pp && iso==x.iso && strength==x.strength; }
+    bool operator!=(const VppT2& x) const { return !(*this==x); }
+    tstring print() const { return strsprintf(_T("mcwiener: mode=%s, profile=%s, pp=%s, iso=%s, strength=%.17g"), mode.c_str(),profile.c_str(),pp.c_str(),iso.c_str(),strength); }
+};
+
 struct VppSMDegrain {
     bool enable;
     int  tr;           // temporal radius (1..3); ring buffer size = 2*tr+1
@@ -2376,6 +2386,7 @@ struct RGYParamVpp {
     VppSmooth smooth;
     VppDenoiseFFT3D fft3d;
     VppSMDegrain smdegrain;
+    VppT2 t2;
     VppMsmooth msmooth;
     std::vector<VppSubburn> subburn;
     std::vector<VppLibplaceboShader> libplacebo_shader;

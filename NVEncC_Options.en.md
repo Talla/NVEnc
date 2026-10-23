@@ -3672,3 +3672,19 @@ Outputs performance information. You can select the information name you want to
 
 ### --perf-monitor-interval &lt;int&gt;
 Specify the time interval for performance monitoring with [--perf-monitor](#--perf-monitor-stringstring) in ms (should be 50 or more). The default is 500.
+
+### --vpp-mcwiener
+
+`--vpp-mcwiener "mode=box,profile=C:/profiles/camera.json,pp=Eterna,iso=6400"`
+
+MCWiener (`--vpp-t2` is a compatibility alias), the native CUDA T2 port with the frozen plain, box and full estimators. `plain` is the lower-noise coarse-layer mode; `box` uses global-translation initialized CUDA box fits on nearby motion; `full` refines all sixteen pairs and retains both full-resolution reconstruction windows. This is opt-in and changes no existing denoiser defaults.
+
+`profile`, `pp`, and `iso` are required. The profile is the existing lab JSON document, with `picture_profiles[pp].noise_profiles[iso].extended` containing NLF levels and Y/Cb/Cr sigma curves (8-bit code sigma), per-plane 2-D PSD and first-lag all/LF/MF/HF temporal correlations. `iso` is an entry selector, not a mode policy. Missing or malformed data fails explicitly. Finite NLF bins use the lab interpolation and endpoint extension, including profiles measured over a partial brightness domain. Quote the entire option value for paths containing spaces; commas are not supported inside paths/keys.
+
+The current native domain is progressive YUV420/422/444 without alpha, dimensions at least 68 and divisible by four, on >=10-bit CUDA surfaces. Use `--output-depth 10` (or a supported deeper raw output). Explicit interlace and unsupported layouts fail. T2 runs on the native source before other color/crop/resize filters. P010/P210 nominal shifted codes are scaled explicitly; no range expansion or transfer conversion occurs. Original timestamps, duration, flags and frame IDs follow the center frame after eight-frame lookahead. EOS uses available neighbors and drains every real frame.
+
+The CUDA toolchain's existing cuFFT runtime is required. The Windows binary retains its existing compute75/86/120 architecture targets; MCWiener validates compute capability>=8.6 at initialization. Native end-to-end numerical/performance evidence and remaining limitations are in the implementation receipt; no speed or full-camera calibration claim follows from mode availability.
+
+MCWiener `strength=<float>` is exactly the lab temporal coefficient `c`, default `1`, finite and nonnegative. For each frequency bin, `A = d2 / max(d2 + strength * 2 * var * (1-rho), 1e-30)`; larger values admit more neighboring temporal support. The reviewed variance multiplier remains `8`; motion, profile noise, mode selection and Wiener variance are not rescaled. `strength=0` is not bypass: Wiener/S1 still filter. Default1 uses the original launcher unchanged; nondefault strength evaluates only this ratio in FP64 to support every representable finite nonnegative double without an arbitrary cap.
+
+When derived confidence leaves the preserved FP32 fit envelope, MCWiener explicitly logs/counts native FP64 definition fits: direct separable box sums for box mode, exact FP64 lower-median initialization plus the existing FP64 local-fit kernel for full mode. The profile and fit definitions are retained; no torch/SAT proxy or new confidence model is used. Nonfinite/invalid FP64-domain state remains an error.

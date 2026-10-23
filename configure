@@ -376,7 +376,7 @@ else
 fi
 
 CUDA_CFLAGS=""
-CUDA_LIBS="-lnppif_static -lnppig_static -lnppc_static -lcudart_static -lculibos -lcuda -lrt"
+CUDA_LIBS="-lnppif_static -lnppig_static -lnppc_static -lcufft -lcudart_static -lculibos -lcuda -lrt"
 if [ "${CUDA_PATH}" != "" ]; then
     cnf_print "checking for cuda (CUDA_PATH=${CUDA_PATH})..."
     CUDA_CFLAGS="-I${CUDA_PATH}/include ${EXTRACUDACXXFLAGS}"
@@ -854,7 +854,7 @@ dynlink_nvcuvid.cpp
 SRC_NVENCCORE=" \
 CuvidDecode.cpp        FrameQueue.cpp              NVEncCmd.cpp                 NVEncCore.cpp \
 NVEncDevice.cpp        NVEncFilter.cpp             NVEncFilterAfs.cpp           NVEncFilterColorspace.cpp \
-NVEncFilterCurves.cpp  NVEncFilterCustom.cpp       NVEncFilterDelogo.cpp        NVEncFilterDenoiseFFT3D.cpp \
+NVEncFilterCurves.cpp  NVEncFilterCustom.cpp       NVEncFilterDelogo.cpp        NVEncFilterDenoiseFFT3D.cpp NVEncFilterT2.cpp \
 NVEncFilterDenoiseGauss.cpp NVEncFilterLibplacebo.cpp NVEncFilterNGX.cpp NVEncFilterNVOFFRUC.cpp \
 NVEncFilterNvvfx.cpp   NVEncFilterOverlay.cpp      NVEncFilterPad.cpp           NVEncFilterParam.cpp \
 NVEncFilterRff.cpp     NVEncFilterSelectEvery.cpp  NVEncFilterSsim.cpp          NVEncFilterSubburn.cpp \
@@ -891,7 +891,7 @@ CU_NVENCCORE=" \
 NVEncFilterAfsAnalyze.cu  NVEncFilterAfsFilter.cu   NVEncFilterAfsMerge.cu   NVEncFilterAfsSynthesize.cu         NVEncFilterConvolution3d.cu \
 NVEncFilterCrop.cu        NVEncFilterCurves.cu      NVEncFilterDeband.cu     NVEncFilterDecimate.cu              NVEncFilterDecomb.cu \
 NVEncFilterDelogo.cu      NVEncFilterDenoiseDct.cu  \
-NVEncFilterDenoiseFFT3D8FP16.cu NVEncFilterDenoiseFFT3D8FP32.cu NVEncFilterDenoiseFFT3D16FP16.cu NVEncFilterDenoiseFFT3D16FP32.cu \
+t2/t2_native.cu NVEncFilterDenoiseFFT3D8FP16.cu NVEncFilterDenoiseFFT3D8FP32.cu NVEncFilterDenoiseFFT3D16FP16.cu NVEncFilterDenoiseFFT3D16FP32.cu \
 NVEncFilterDenoiseKnn.cu  NVEncFilterDenoiseNLMeans.cu NVEncFilterDenoisePmd.cu  \
 NVEncFilterEdgelevel.cu   NVEncFilterMpdecimate.cu  NVEncFilterNnedi.cu \
 NVEncFilterOverlay.cu     NVEncFilterResize.cu      NVEncFilterSmooth.cu     NVEncFilterSsim.cu                  NVEncFilterSubburn.cu \
