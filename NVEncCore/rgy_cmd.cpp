@@ -10072,7 +10072,7 @@ tstring gen_cmd_help_vpp() {
         _T("   --vpp-mcwiener mode=<plain|box|full>,profile=<path>,pp=<key>,iso=<entry>[,strength=<float>]\n")
         _T("     strength: exact lab c, finite >=0, default1; larger admits more temporal support.\n")
         _T("     strength=0 is not bypass: Wiener/S1 remain; fixed variance multiplier8.\n")
-        _T("     MCWiener (alias --vpp-t2); extended NLF/PSD/temporal profile required; progressive >=10-bit YUV.\n")
+        _T("     MCWiener (alias --vpp-t2); extended NLF/PSD/temporal profile required; progressive 8-bit or deeper YUV; 8-bit surfaces are filtered as 8-bit, so still use --output-depth 10.\n")
         _T("   --vpp-fft3d [<param1>=<value>][,<param2>=<value>][...]\n")
         _T("     enable fft based denoise filter.\n")
         _T("    params\n")
