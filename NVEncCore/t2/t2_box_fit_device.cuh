@@ -104,13 +104,22 @@ __global__ void box_select(CandPtrs cp,VecPtrs vp,IntList16 targets,int B,int N,
 // ---- fix 4: all candidates of all pairs in one launch; reference spectrum once per tile; block reductions instead of
 // 256-term serial sums per thread (FP32 summation order differs from `score`; same formulas otherwise). ----
 struct PairPtrs { const float* nb[4]; const float* v0[4]; };
-__device__ __forceinline__ float score_block_sum(float x,float* red){
+// exact!=0: sequential float sum in index order on one thread (bit-identical to the 256-term loops of `score`);
+// exact==0: warp-shuffle tree (differs from `score` at FP32 rounding level; flips ~1e-5 of the tile choices).
+__device__ __forceinline__ float score_block_sum(float x,float* red,float* ex,int exact){
+    if(exact){
+        ex[threadIdx.x]=x;__syncthreads();
+        if(threadIdx.x==0){float s=0;
+#pragma unroll 16
+            for(int i=0;i<256;++i)s+=ex[i];red[0]=s;}
+        __syncthreads();float r=red[0];__syncthreads();return r;
+    }
     for(int o=16;o;o>>=1)x+=__shfl_xor_sync(0xffffffffu,x,o);
     if((threadIdx.x&31)==0)red[threadIdx.x>>5]=x;
     __syncthreads();float s=0;for(int i=0;i<8;++i)s+=red[i];__syncthreads();return s;
 }
-__global__ void __launch_bounds__(256) score_multi(const float* ref,PairPtrs pp,CandPtrs cp,int B,const float* win,const float* var,float* E,int h,int w,int oy,int ox,int nx,int N){
-    __shared__ float2 b[272],tmp[272],tw[15];__shared__ float red[8];
+__global__ void __launch_bounds__(256) score_multi(const float* ref,PairPtrs pp,CandPtrs cp,int B,const float* win,const float* var,float* E,int h,int w,int oy,int ox,int nx,int N,int exact){
+    __shared__ float2 b[272],tmp[272],tw[15];__shared__ float red[8],ex[256];
     const int tile=blockIdx.x,tid=threadIdx.x,idx=(tid>>4)*17+(tid&15);
     if(tid<15)tw[tid]=T2_TW[tid];
     const int fx0=tid&15,fy0=tid>>4;const int fx=fx0>=8?fx0-16:fx0,fy=fy0>=8?fy0-16:fy0;
@@ -119,18 +128,18 @@ __global__ void __launch_bounds__(256) score_multi(const float* ref,PairPtrs pp,
     float2 s0;
     {
         int y=max(-96,min(h+95,ty)),x=max(-96,min(w+95,tx));float val=ref[mirror_index(y,h)*w+mirror_index(x,w)];
-        float mean=score_block_sum(val*wtid,red);
+        float mean=score_block_sum(val*wtid,red,ex,exact);
         b[idx]=make_float2((val-mean/64.f)*wtid,0);__syncthreads();t2_fft16_shared(b,tmp,tw,0,1);s0=b[idx];__syncthreads();
     }
     for(int bb=0;bb<B;++bb)for(int c=0;c<7;++c){
         const float* vec=c==0?pp.v0[bb]:cp.p[c-1]+(size_t)bb*2*N;
         const float vx=vec[2*tile],vy=vec[2*tile+1];const float rx=nearbyintf(vx),ry=nearbyintf(vy);
         int y=max(-96,min(h+95,ty+(int)ry)),x=max(-96,min(w+95,tx+(int)rx));float val=pp.nb[bb][mirror_index(y,h)*w+mirror_index(x,w)];
-        float mean=score_block_sum(val*wtid,red);
+        float mean=score_block_sum(val*wtid,red,ex,exact);
         b[idx]=make_float2((val-mean/64.f)*wtid,0);__syncthreads();t2_fft16_shared(b,tmp,tw,0,1);float2 z=b[idx];__syncthreads();
         float angle=2*float(3.14159265358979323846)/16*(fx*(vx-rx)+fy*(vy-ry)),sn,cs;__sincosf(angle,&sn,&cs);
         float dx=s0.x-(z.x*cs-z.y*sn),dy=s0.y-(z.x*sn+z.y*cs);
-        float q=tid?(dx*dx+dy*dy)/vden:0;float sum=score_block_sum(q,red);
+        float q=tid?(dx*dx+dy*dy)/vden:0;float sum=score_block_sum(q,red,ex,exact);
         if(tid==0)E[((size_t)bb*7+c)*N+tile]=sum/255.f;
     }
 }

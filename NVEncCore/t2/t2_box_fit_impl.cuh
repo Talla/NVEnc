@@ -51,7 +51,7 @@ bool Engine::Impl::fit_box_device(std::vector<Buf<float>>& v,const std::vector<i
     CandPtrs cp;for(int c=0;c<6;++c)cp.p[c]=cand[c].p;
     if(level>=4){
         PairPtrs pp{};for(int b=0;b<B;++b){int k=targets[b];pp.nb[b]=ring[(ref.index+ks[k])%17].image[0].b.p;pp.v0[b]=v[k].p;}
-        score_multi<<<N,256,0,stream>>>(ref.image[0].b.p,pp,cp,B,win.p,var.p,E.p,h,w,oy,ox,nx,N);
+        score_multi<<<N,256,0,stream>>>(ref.image[0].b.p,pp,cp,B,win.p,var.p,E.p,h,w,oy,ox,nx,N,std::getenv("T2_NATIVE_SCORE_FAST")?0:1);
     }else
     for(int b=0;b<B;++b){int k=targets[b];Source& nb=ring[(ref.index+ks[k])%17];
         for(int c=0;c<7;++c)score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:cand[c-1].p+size_t(b)*2*N,win.p,var.p,E.p+(size_t(b)*7+c)*N,h,w,oy,ox,nx);}
