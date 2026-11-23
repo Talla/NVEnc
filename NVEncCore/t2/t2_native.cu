@@ -39,18 +39,93 @@ __device__ unsigned native_t2_warp_max_legacy(unsigned mask,unsigned v){for(int 
 namespace native_t2 {
 static void ck(cudaError_t e) { if(e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e)); }
 static void fk(cufftResult e) { if(e != CUFFT_SUCCESS) throw std::runtime_error("T2 cuFFT error " + std::to_string(e)); }
+
+// All Engine work uses one bound stream. A returned block can be reused by
+// later commands on that stream without synchronizing with its previous use.
+class ScratchPool {
+public:
+    struct Block { void *ptr = nullptr; bool inUse = true; };
+
+    ~ScratchPool() {
+        for (auto& block : blocks_) cudaFree(block.second.ptr);
+    }
+
+    Block* acquire(size_t bytes) {
+        // Allow closely sized blocks to cover changes in edge tile counts.
+        for (auto it = blocks_.lower_bound(bytes); it != blocks_.end() && it->first - bytes <= bytes / 4; ++it) {
+            if (!it->second.inUse) {
+                it->second.inUse = true;
+                return &it->second;
+            }
+        }
+        auto it = blocks_.emplace(bytes, Block{});
+        try {
+            auto status = cudaMalloc(&it->second.ptr, bytes);
+            if (status == cudaErrorMemoryAllocation) {
+                cudaGetLastError();
+                // Cached blocks should not turn a recoverable allocation into OOM.
+                for (auto cached = blocks_.begin(); cached != blocks_.end();) {
+                    if (cached->second.inUse) {
+                        ++cached;
+                    } else {
+                        ck(cudaFree(cached->second.ptr));
+                        cached = blocks_.erase(cached);
+                    }
+                }
+                status = cudaMalloc(&it->second.ptr, bytes);
+            }
+            ck(status);
+        } catch (...) {
+            blocks_.erase(it);
+            throw;
+        }
+        return &it->second;
+    }
+
+private:
+    std::multimap<size_t, Block> blocks_;
+};
+
 template<class T> struct Buf {
     T *p=nullptr; size_t n=0;
-    Buf()=default; explicit Buf(size_t count) { size(count); }
+    Buf()=default;
+    Buf(ScratchPool& pool, size_t count) { size(pool, count); }
     Buf(const Buf&)=delete; Buf& operator=(const Buf&)=delete;
-    Buf(Buf&& b) noexcept : p(b.p),n(b.n) { b.p=nullptr;b.n=0; }
-    Buf& operator=(Buf&& b) noexcept { if(this!=&b){if(p)cudaFree(p);p=b.p;n=b.n;b.p=nullptr;b.n=0;}return *this; }
-    ~Buf(){if(p)cudaFree(p);}
-    void size(size_t count){if(count>n){if(p)ck(cudaFree(p));p=nullptr;ck(cudaMalloc((void**)&p,count*sizeof(T)));n=count;}}
-    void put(const std::vector<T>& v,cudaStream_t s){size(v.size());ck(cudaMemcpyAsync(p,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice,s));ck(cudaStreamSynchronize(s));}
+    Buf(Buf&& other) noexcept { *this = std::move(other); }
+    Buf& operator=(Buf&& other) noexcept {
+        if (this != &other) {
+            release();
+            p = other.p;
+            n = other.n;
+            block_ = other.block_;
+            other.p = nullptr;
+            other.n = 0;
+            other.block_ = nullptr;
+        }
+        return *this;
+    }
+    ~Buf() { release(); }
+
+    void size(ScratchPool& pool, size_t count) {
+        if (count <= n) return;
+        release();
+        block_ = pool.acquire(count * sizeof(T));
+        p = static_cast<T*>(block_->ptr);
+        n = count;
+    }
+    void put(ScratchPool& pool,const std::vector<T>& v,cudaStream_t s){size(pool,v.size());ck(cudaMemcpyAsync(p,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice,s));ck(cudaStreamSynchronize(s));}
     std::vector<T> get(size_t count,cudaStream_t s) const {std::vector<T> v(count);ck(cudaMemcpyAsync(v.data(),p,count*sizeof(T),cudaMemcpyDeviceToHost,s));ck(cudaStreamSynchronize(s));return v;}
+
+private:
+    void release() noexcept {
+        if (block_) block_->inUse = false;
+        block_ = nullptr;
+        p = nullptr;
+        n = 0;
+    }
+    ScratchPool::Block* block_ = nullptr;
 };
-struct Image { int h=0,w=0; Buf<float> b; Image()=default; Image(int hh,int ww):h(hh),w(ww),b(size_t(hh)*ww){} };
+struct Image { int h=0,w=0; Buf<float> b; Image()=default; Image(ScratchPool& pool,int hh,int ww):h(hh),w(ww),b(pool,size_t(hh)*ww){} };
 static int blocks(size_t n){return int((n+255)/256);}
 template<class T> static void trace_buffer(const Buf<T>& b,size_t n,const std::string& name,cudaStream_t stream){const char* dir=std::getenv("T2_NATIVE_TRACE");if(!dir)return;auto v=b.get(n,stream);std::ofstream f(std::string(dir)+"/"+name,std::ios::binary);if(!f)throw std::runtime_error("T2 diagnostic trace path unavailable");f.write((const char*)v.data(),v.size()*sizeof(T));}
 constexpr double PI=3.14159265358979323846;
@@ -96,6 +171,7 @@ extern "C" DL_EXPORT int dl_t2_native_median_seed64_host(const double* Y,const d
 struct Engine::Impl {
     struct Source { int64_t index=-1; std::array<Image,3> image,coarse; std::vector<Image> pyr,coeff,conf; };
     int h,w,sx,sy,device; std::string mode; Model model; double strength; cudaStream_t stream=nullptr; bool bound=false;
+    ScratchPool scratchPool; // Declared before buffers so the pool outlives every lease.
     std::array<Source,17> ring;
     Buf<float> win; Buf<float2> ws,basis; std::array<Buf<float>,3> xp,fp,shapes,cshapes;
     std::map<std::pair<int,int>,cufftHandle> plans;
@@ -105,14 +181,14 @@ struct Engine::Impl {
     ~Impl(){for(auto& x:plans)cufftDestroy(x.second);}
     void bind(cudaStream_t s){if(bound&&stream!=s)throw std::runtime_error("T2 stream changed within one filter instance");stream=s;bound=true;}
     void fft(Buf<float2>& b,int H,int W,bool inverse){auto key=std::make_pair(H,W);auto it=plans.find(key);if(it==plans.end()){cufftHandle plan;fk(cufftPlan2d(&plan,H,W,CUFFT_C2C));it=plans.emplace(key,plan).first;}fk(cufftSetStream(it->second,stream));fk(cufftExecC2C(it->second,b.p,b.p,inverse?CUFFT_INVERSE:CUFFT_FORWARD));}
-    Buf<float>& kernel(float sig){int k=int(sig*10+.5f);auto it=gaussian.find(k);if(it==gaussian.end()){int r=int(std::ceil(3*sig));std::vector<float> v(2*r+1);float sum=0;for(int j=-r;j<=r;++j){v[j+r]=std::exp(-.5f*(j/sig)*(j/sig));sum+=v[j+r];}for(auto& x:v)x/=sum;Buf<float> b;b.put(v,stream);it=gaussian.emplace(k,std::move(b)).first;}return it->second;}
-    Image blur(const Image& a,float sig,int channels=1){Image b(a.h,a.w);b.b.size(size_t(a.h)*a.w*channels);Buf<float> tmp(size_t(a.h)*a.w*channels);auto& k=kernel(sig);ck((cudaError_t)dl_blur(a.b.p,tmp.p,b.b.p,k.p,1,channels,a.h,a.w,int(k.n/2),device,stream));return b;}
-    Image down(const Image& a,int factor){Image b(a.h/factor,a.w/factor);pool<<<blocks(b.h*b.w),256,0,stream>>>(a.b.p,b.b.p,a.h,a.w,b.h,b.w);return b;}
-    Image spline(const Image& a){int hp=a.h+32,wp=a.w+32;Buf<float2> z(size_t(hp)*wp);pad_complex<<<blocks(hp*wp),256,0,stream>>>(a.b.p,z.p,a.h,a.w,hp,wp,16,16);fft(z,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(z.p,hp,wp,1,1,1);fft(z,hp,wp,true);Image out(a.h,a.w);project<<<blocks(a.h*a.w),256,0,stream>>>(z.p,out.b.p,hp,wp,a.h,a.w,16,16,1.f/(hp*wp));return out;}
-    Image conf(const Image& a){Image p(a.h,a.w);p.b.size(size_t(3)*a.h*a.w);gradient_products<<<blocks(a.h*a.w),256,0,stream>>>(a.b.p,p.b.p,a.h,a.w);Image b=blur(p,2.f,3);Image c(a.h,a.w);confidence<<<blocks(a.h*a.w),256,0,stream>>>(b.b.p,c.b.p,a.h*a.w);auto v=c.b.get(a.h*a.w,stream);float maxval=std::max(1e-12f,*std::max_element(v.begin(),v.end()));divide<<<blocks(a.h*a.w),256,0,stream>>>(c.b.p,a.h*a.w,maxval);return c;}
+    Buf<float>& kernel(float sig){int k=int(sig*10+.5f);auto it=gaussian.find(k);if(it==gaussian.end()){int r=int(std::ceil(3*sig));std::vector<float> v(2*r+1);float sum=0;for(int j=-r;j<=r;++j){v[j+r]=std::exp(-.5f*(j/sig)*(j/sig));sum+=v[j+r];}for(auto& x:v)x/=sum;Buf<float> b;b.put(scratchPool,v,stream);it=gaussian.emplace(k,std::move(b)).first;}return it->second;}
+    Image blur(const Image& a,float sig,int channels=1){Image b(scratchPool,a.h,a.w);b.b.size(scratchPool,size_t(a.h)*a.w*channels);Buf<float> tmp(scratchPool,size_t(a.h)*a.w*channels);auto& k=kernel(sig);ck((cudaError_t)dl_blur(a.b.p,tmp.p,b.b.p,k.p,1,channels,a.h,a.w,int(k.n/2),device,stream));return b;}
+    Image down(const Image& a,int factor){Image b(scratchPool,a.h/factor,a.w/factor);pool<<<blocks(b.h*b.w),256,0,stream>>>(a.b.p,b.b.p,a.h,a.w,b.h,b.w);return b;}
+    Image spline(const Image& a){int hp=a.h+32,wp=a.w+32;Buf<float2> z(scratchPool,size_t(hp)*wp);pad_complex<<<blocks(hp*wp),256,0,stream>>>(a.b.p,z.p,a.h,a.w,hp,wp,16,16);fft(z,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(z.p,hp,wp,1,1,1);fft(z,hp,wp,true);Image out(scratchPool,a.h,a.w);project<<<blocks(a.h*a.w),256,0,stream>>>(z.p,out.b.p,hp,wp,a.h,a.w,16,16,1.f/(hp*wp));return out;}
+    Image conf(const Image& a){Image p(scratchPool,a.h,a.w);p.b.size(scratchPool,size_t(3)*a.h*a.w);gradient_products<<<blocks(a.h*a.w),256,0,stream>>>(a.b.p,p.b.p,a.h,a.w);Image b=blur(p,2.f,3);Image c(scratchPool,a.h,a.w);confidence<<<blocks(a.h*a.w),256,0,stream>>>(b.b.p,c.b.p,a.h*a.w);auto v=c.b.get(a.h*a.w,stream);float maxval=std::max(1e-12f,*std::max_element(v.begin(),v.end()));divide<<<blocks(a.h*a.w),256,0,stream>>>(c.b.p,a.h*a.w,maxval);return c;}
     std::pair<int,int> padded(int H,int W,int X,int Y){int dx=4/X,dy=4/Y;return {H+64/Y+(dy-H%dy)%dy,W+64/X+(dx-W%dx)%dx};}
-    Image decimate(const Image& a,int X,int Y){auto hw=padded(a.h,a.w,X,Y);int hp=hw.first,wp=hw.second,hc=hp/(4/Y),wc=wp/(4/X),area=16/(X*Y);Buf<float2> z(size_t(hp)*wp),c(size_t(hc)*wc);pad_complex<<<blocks(hp*wp),256,0,stream>>>(a.b.p,z.p,a.h,a.w,hp,wp,32/Y,32/X);fft(z,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(z.p,hp,wp,X,Y,0);coarse_extract_full<<<blocks(hc*wc),256,0,stream>>>(z.p,c.p,hp,wp,hc,wc,area);fft(c,hc,wc,true);Image out(hc,wc);project<<<blocks(hc*wc),256,0,stream>>>(c.p,out.b.p,hc,wc,hc,wc,0,0,1.f/(hc*wc));return out;}
-    void recombine(Image& a,Image& c,int X,int Y){Image d=decimate(a,X,Y);subtract<<<blocks(c.h*c.w),256,0,stream>>>(c.b.p,d.b.p,c.h*c.w);auto hw=padded(a.h,a.w,X,Y);int hp=hw.first,wp=hw.second;Buf<float2> z(size_t(c.h)*c.w),full(size_t(hp)*wp);to_complex<<<blocks(c.h*c.w),256,0,stream>>>(c.b.p,z.p,c.h*c.w);fft(z,c.h,c.w,false);coarse_embed_full<<<blocks(hp*wp),256,0,stream>>>(z.p,full.p,hp,wp,c.h,c.w,X,Y,16/(X*Y));fft(full,hp,wp,true);crop_add<<<blocks(a.h*a.w),256,0,stream>>>(a.b.p,full.p,a.h,a.w,hp,wp,32/Y,32/X);}
+    Image decimate(const Image& a,int X,int Y){auto hw=padded(a.h,a.w,X,Y);int hp=hw.first,wp=hw.second,hc=hp/(4/Y),wc=wp/(4/X),area=16/(X*Y);Buf<float2> z(scratchPool,size_t(hp)*wp),c(scratchPool,size_t(hc)*wc);pad_complex<<<blocks(hp*wp),256,0,stream>>>(a.b.p,z.p,a.h,a.w,hp,wp,32/Y,32/X);fft(z,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(z.p,hp,wp,X,Y,0);coarse_extract_full<<<blocks(hc*wc),256,0,stream>>>(z.p,c.p,hp,wp,hc,wc,area);fft(c,hc,wc,true);Image out(scratchPool,hc,wc);project<<<blocks(hc*wc),256,0,stream>>>(c.p,out.b.p,hc,wc,hc,wc,0,0,1.f/(hc*wc));return out;}
+    void recombine(Image& a,Image& c,int X,int Y){Image d=decimate(a,X,Y);subtract<<<blocks(c.h*c.w),256,0,stream>>>(c.b.p,d.b.p,c.h*c.w);auto hw=padded(a.h,a.w,X,Y);int hp=hw.first,wp=hw.second;Buf<float2> z(scratchPool,size_t(c.h)*c.w),full(scratchPool,size_t(hp)*wp);to_complex<<<blocks(c.h*c.w),256,0,stream>>>(c.b.p,z.p,c.h*c.w);fft(z,c.h,c.w,false);coarse_embed_full<<<blocks(hp*wp),256,0,stream>>>(z.p,full.p,hp,wp,c.h,c.w,X,Y,16/(X*Y));fft(full,hp,wp,true);crop_add<<<blocks(a.h*a.w),256,0,stream>>>(a.b.p,full.p,a.h,a.w,hp,wp,32/Y,32/X);}
     void constants();
     void ingest(int64_t index,const FrameView& frame);
     Buf<float> motion(Source& a,Source& b,int oy,int ox,Buf<float>* dense);
@@ -128,10 +204,10 @@ void Engine::Impl::constants(){
     std::vector<float> window(256);std::vector<float2> spectrum(256),b(256);
     for(int y=0;y<16;++y)for(int x=0;x<16;++x)window[y*16+x]=float((.5-.5*std::cos(2*PI*y/16))*(.5-.5*std::cos(2*PI*x/16)));
     for(int y=0;y<16;++y)for(int x=0;x<16;++x){std::complex<double> z=0.;for(int j=0;j<16;++j)for(int i=0;i<16;++i)z+=double(window[j*16+i])*std::polar(1.,-2*PI*(double(y*j+x*i)/16));spectrum[y*16+x]=make_float2(float(z.real()),float(z.imag()));b[y*16+x]=make_float2(float(z.real()/64),float(z.imag()/64));}
-    win.put(window,stream);ws.put(spectrum,stream);basis.put(b,stream);
-    for(int p=0;p<3;++p){auto& m=model.planes[p];std::vector<float> a(m.levels.begin(),m.levels.end()),s(m.sigma.begin(),m.sigma.end()),shape(256),coarse(256);xp[p].put(a,stream);fp[p].put(s,stream);int n=m.psdSize;
+    win.put(scratchPool,window,stream);ws.put(scratchPool,spectrum,stream);basis.put(scratchPool,b,stream);
+    for(int p=0;p<3;++p){auto& m=model.planes[p];std::vector<float> a(m.levels.begin(),m.levels.end()),s(m.sigma.begin(),m.sigma.end()),shape(256),coarse(256);xp[p].put(scratchPool,a,stream);fp[p].put(scratchPool,s,stream);int n=m.psdSize;
         auto ps=[&](int y,int x){return m.psd[((y+n/2)%n)*n+(x+n/2)%n];};
-        double sum=0;for(int y=0;y<16;++y)for(int x=0;x<16;++x){int iy=0,ix=0;for(int j=1;j<n;++j){if(std::abs(freq(j,n)-freq(y,16))<std::abs(freq(iy,n)-freq(y,16)))iy=j;if(std::abs(freq(j,n)-freq(x,16))<std::abs(freq(ix,n)-freq(x,16)))ix=j;}sum+=shape[y*16+x]=float(ps(iy,ix));}for(auto& x:shape)x=float(x/(sum/256));shapes[p].put(shape,stream);
+        double sum=0;for(int y=0;y<16;++y)for(int x=0;x<16;++x){int iy=0,ix=0;for(int j=1;j<n;++j){if(std::abs(freq(j,n)-freq(y,16))<std::abs(freq(iy,n)-freq(y,16)))iy=j;if(std::abs(freq(j,n)-freq(x,16))<std::abs(freq(ix,n)-freq(x,16)))ix=j;}sum+=shape[y*16+x]=float(ps(iy,ix));}for(auto& x:shape)x=float(x/(sum/256));shapes[p].put(scratchPool,shape,stream);
         // Exact 128-grid propagation of the PSD through coarse lowpass and periodic Hann.
         int X=p?sx:1,Y=p?sy:1;std::vector<double> A(16*128),S(128*128),tmp(16*128);
         for(int k=0;k<16;++k)for(int j=0;j<128;++j){std::complex<double> z=0.;for(int t=0;t<16;++t)z+=(.5-.5*std::cos(2*PI*t/16))*std::polar(1.,-2*PI*(freq(k,16)-freq(j,128))*t);A[k*128+j]=std::norm(z);}
@@ -139,60 +215,89 @@ void Engine::Impl::constants(){
         auto src=[&](int y,int x){y=(y%n+n)%n;x=(x%n+n)%n;return (x||y)?ps(y,x):dc;};
         for(int y=0;y<128;++y)for(int x=0;x<128;++x){double fy=freq(y,128)/4,fx=freq(x,128)/4,py=fy*Y*n,px=fx*X*n;int iy=int(std::floor(py)),ix=int(std::floor(px));double ty=py-iy,tx=px-ix;double val=(src(iy,ix)*(1-tx)+src(iy,ix+1)*tx)*(1-ty)+(src(iy+1,ix)*(1-tx)+src(iy+1,ix+1)*tx)*ty;double H=low(std::hypot(fy,fx));S[y*128+x]=val*H*H/(16/(X*Y));}
         for(int k=0;k<16;++k)for(int x=0;x<128;++x){double z=0;for(int y=0;y<128;++y)z+=A[k*128+y]*S[y*128+x];tmp[k*128+x]=z;}
-        for(int y=0;y<16;++y)for(int x=0;x<16;++x){double z=0;for(int j=0;j<128;++j)z+=tmp[y*128+j]*A[x*128+j];coarse[y*16+x]=float(z/(128*128*36.));}cshapes[p].put(coarse,stream);
+        for(int y=0;y<16;++y)for(int x=0;x<16;++x){double z=0;for(int j=0;j<128;++j)z+=tmp[y*128+j]*A[x*128+j];coarse[y*16+x]=float(z/(128*128*36.));}cshapes[p].put(scratchPool,coarse,stream);
     }
 }
 
 void Engine::Impl::ingest(int64_t index,const FrameView& frame){
     constants();Source& s=ring[index%17];s.index=index;
-    for(int p=0;p<3;++p){auto& v=frame.plane[p];s.image[p]=Image(v.height,v.width);read_plane<<<blocks(v.height*v.width),256,0,stream>>>(v,s.image[p].b.p);s.coarse[p]=decimate(s.image[p],p?sx:1,p?sy:1);}
+    for(int p=0;p<3;++p){auto& v=frame.plane[p];s.image[p]=Image(scratchPool,v.height,v.width);read_plane<<<blocks(v.height*v.width),256,0,stream>>>(v,s.image[p].b.p);s.coarse[p]=decimate(s.image[p],p?sx:1,p?sy:1);}
     s.pyr.clear();s.coeff.clear();s.conf.clear();Image g=blur(s.image[0],1.f);s.pyr.push_back(down(g,4));for(int j=1;j<3;++j){Image b=blur(s.pyr.back(),.8f);s.pyr.push_back(down(b,2));}for(auto& a:s.pyr){s.coeff.push_back(spline(a));s.conf.push_back(conf(a));}ck(cudaGetLastError());
 }
 
 Buf<float> Engine::Impl::motion(Source& a,Source& b,int oy,int ox,Buf<float>* dense){
     int levels=1;while(levels<3&&std::min(a.pyr[levels-1].h,a.pyr[levels-1].w)>=16)++levels;
     Buf<float> fb;int ph=0,pw=0;int block=std::min(8,std::min(a.pyr[0].h,a.pyr[0].w));
-    for(int lvl=levels-1;lvl>=0;--lvl){auto& A=a.pyr[lvl];auto& B=b.pyr[lvl];int by=A.h/block,bx=A.w/block,n=by*bx,r=lvl==levels-1?8:4;Buf<float> init(2*n),cost(size_t((2*r+1)*(2*r+1))*n),out(2*n);if(!fb.p)ck(cudaMemsetAsync(init.p,0,2*n*sizeof(float),stream));else ck((cudaError_t)dl_bm_init(fb.p,init.p,ph,pw,by,bx,float(ph)/by,float(pw)/bx,device,stream));if(block==8)ck((cudaError_t)dl_sad_warp(A.b.p,B.b.p,init.p,cost.p,A.h,A.w,r,device,stream));else ck((cudaError_t)dl_sad(A.b.p,B.b.p,init.p,cost.p,A.h,A.w,block,r,device,stream));ck((cudaError_t)dl_bm_glue(cost.p,init.p,out.p,2*r+1,by,bx,device,stream));fb=std::move(out);ph=by;pw=bx;}
-    Buf<float> flow(size_t(2)*a.pyr[0].h*a.pyr[0].w);resize_flow<<<blocks(2*a.pyr[0].h*a.pyr[0].w),256,0,stream>>>(fb.p,flow.p,ph,pw,a.pyr[0].h,a.pyr[0].w,0,1,1);ph=a.pyr[0].h;pw=a.pyr[0].w;
-    for(int lvl=2;lvl>=0;--lvl){auto& A=a.pyr[lvl];int n=A.h*A.w;Buf<float> f(2*n);resize_flow<<<blocks(2*n),256,0,stream>>>(flow.p,f.p,ph,pw,A.h,A.w,1,float(A.w-1)/std::max(pw-1,1),float(A.h-1)/std::max(ph-1,1));flow=std::move(f);Buf<float> stats(5*n),upd(2*n),sm(2*n);auto& k=kernel(2.f);for(int j=0;j<4;++j){ck((cudaError_t)dl_lk_sp_products(b.coeff[lvl].b.p,flow.p,A.b.p,stats.p,A.h,A.w,device,stream));ck((cudaError_t)dl_lk_blur_solve(stats.p,flow.p,k.p,upd.p,A.h,A.w,6,1e-4f,device,stream));ck((cudaError_t)dl_nc_fused(upd.p,a.conf[lvl].b.p,k.p,sm.p,A.h,A.w,6,device,stream));std::swap(flow,sm);}ph=A.h;pw=A.w;}
-    int nx=(w+16+ox)/8+1,ny=(h+16+oy)/8+1;Buf<float> out(2*nx*ny);tile_vectors<<<blocks(2*nx*ny),256,0,stream>>>(flow.p,out.p,ph,pw,h,w,oy,ox,nx,nx*ny);if(dense)*dense=std::move(flow);++pairs;return out;
+    for(int lvl=levels-1;lvl>=0;--lvl){auto& A=a.pyr[lvl];auto& B=b.pyr[lvl];int by=A.h/block,bx=A.w/block,n=by*bx,r=lvl==levels-1?8:4;Buf<float> init(scratchPool,2*n),cost(scratchPool,size_t((2*r+1)*(2*r+1))*n),out(scratchPool,2*n);if(!fb.p)ck(cudaMemsetAsync(init.p,0,2*n*sizeof(float),stream));else ck((cudaError_t)dl_bm_init(fb.p,init.p,ph,pw,by,bx,float(ph)/by,float(pw)/bx,device,stream));if(block==8)ck((cudaError_t)dl_sad_warp(A.b.p,B.b.p,init.p,cost.p,A.h,A.w,r,device,stream));else ck((cudaError_t)dl_sad(A.b.p,B.b.p,init.p,cost.p,A.h,A.w,block,r,device,stream));ck((cudaError_t)dl_bm_glue(cost.p,init.p,out.p,2*r+1,by,bx,device,stream));fb=std::move(out);ph=by;pw=bx;}
+    Buf<float> flow(scratchPool,size_t(2)*a.pyr[0].h*a.pyr[0].w);resize_flow<<<blocks(2*a.pyr[0].h*a.pyr[0].w),256,0,stream>>>(fb.p,flow.p,ph,pw,a.pyr[0].h,a.pyr[0].w,0,1,1);ph=a.pyr[0].h;pw=a.pyr[0].w;
+    for(int lvl=2;lvl>=0;--lvl){auto& A=a.pyr[lvl];int n=A.h*A.w;Buf<float> f(scratchPool,2*n);resize_flow<<<blocks(2*n),256,0,stream>>>(flow.p,f.p,ph,pw,A.h,A.w,1,float(A.w-1)/std::max(pw-1,1),float(A.h-1)/std::max(ph-1,1));flow=std::move(f);Buf<float> stats(scratchPool,5*n),upd(scratchPool,2*n),sm(scratchPool,2*n);auto& k=kernel(2.f);for(int j=0;j<4;++j){ck((cudaError_t)dl_lk_sp_products(b.coeff[lvl].b.p,flow.p,A.b.p,stats.p,A.h,A.w,device,stream));ck((cudaError_t)dl_lk_blur_solve(stats.p,flow.p,k.p,upd.p,A.h,A.w,6,1e-4f,device,stream));ck((cudaError_t)dl_nc_fused(upd.p,a.conf[lvl].b.p,k.p,sm.p,A.h,A.w,6,device,stream));std::swap(flow,sm);}ph=A.h;pw=A.w;}
+    int nx=(w+16+ox)/8+1,ny=(h+16+oy)/8+1;Buf<float> out(scratchPool,2*nx*ny);tile_vectors<<<blocks(2*nx*ny),256,0,stream>>>(flow.p,out.p,ph,pw,h,w,oy,ox,nx,nx*ny);if(dense)*dense=std::move(flow);++pairs;return out;
 }
 
-Buf<float> Engine::Impl::vars(const Image& image,int p,int oy,int ox,bool coarse){int nx=(image.w+16+ox)/8+1,ny=(image.h+16+oy)/8+1,N=nx*ny;Buf<float> lvl(N),v(size_t(N)*256);means<<<blocks(N),256,0,stream>>>(image.b.p,lvl.p,image.h,image.w,oy,ox,nx,N);variance<<<blocks(size_t(N)*256),256,0,stream>>>(lvl.p,xp[p].p,fp[p].p,int(xp[p].n),(coarse?cshapes[p]:shapes[p]).p,v.p,N);return v;}
+Buf<float> Engine::Impl::vars(const Image& image,int p,int oy,int ox,bool coarse){int nx=(image.w+16+ox)/8+1,ny=(image.h+16+oy)/8+1,N=nx*ny;Buf<float> lvl(scratchPool,N),v(scratchPool,size_t(N)*256);means<<<blocks(N),256,0,stream>>>(image.b.p,lvl.p,image.h,image.w,oy,ox,nx,N);variance<<<blocks(size_t(N)*256),256,0,stream>>>(lvl.p,xp[p].p,fp[p].p,int(xp[p].n),(coarse?cshapes[p]:shapes[p]).p,v.p,N);return v;}
 Image Engine::Impl::reconstruction(const Image& ref,const std::vector<const Image*>& nb,const std::vector<Buf<float>>& v,const std::vector<int>& use,const Image& level,int p,int oy,int ox,bool coarse){
-    int nx=(ref.w+16+ox)/8+1,ny=(ref.h+16+oy)/8+1,N=nx*ny;Buf<float> var=vars(level,p,oy,ox,coarse),count(size_t(N)*256),tiles(size_t(N)*256);Buf<float2> M(size_t(N)*256);MainArgs args{};std::vector<Buf<long long>> sh;std::vector<Buf<float>> fr;sh.reserve(use.size());fr.reserve(use.size());for(int i:use){sh.emplace_back(2*N);fr.emplace_back(2*N);alignment<<<blocks(2*N),256,0,stream>>>(v[i].p,sh.back().p,fr.back().p,2*N);int j=args.k++;args.img[j]=nb[i]->b.p;args.shift[j]=sh.back().p;args.frac[j]=fr.back().p;}float cnt=float(1+use.size());Buf<float> mergeVar;const float* mergeVariance=var.p;float noiseFactor=float(2*(1-model.planes[p].rho));if(coarse){mergeVar.size(size_t(N)*256);coarse_variance<<<blocks(size_t(N)*256),256,0,stream>>>(var.p,mergeVar.p,N*256,float(model.planes[p].rho));mergeVariance=mergeVar.p;noiseFactor=1.f;}if(strength==1.0){t2_main_merge<<<N,256,0,stream>>>(ref.b.p,win.p,mergeVariance,args,noiseFactor,1/cnt,cnt,coarse?0:!(use.size()>=1&&use.size()<=8),ws.p,coarse?2:0,64,M.p,count.p,tiles.p,ref.h,ref.w,oy,ox,nx);}else{native_t2_main_merge_scaled<<<N,256,0,stream>>>(ref.b.p,win.p,mergeVariance,args,noiseFactor,strength,1/cnt,cnt,coarse?0:!(use.size()>=1&&use.size()<=8),ws.p,coarse?2:0,64,M.p,count.p,tiles.p,ref.h,ref.w,oy,ox,nx);}Image pilot(ref.h,ref.w),out(ref.h,ref.w);t2_fold_real<<<blocks(ref.h*ref.w),256,0,stream>>>(tiles.p,pilot.b.p,ref.h,ref.w,oy,ox,nx);t2_main_wiener<<<N,256,0,stream>>>(M.p,var.p,count.p,basis.p,pilot.b.p,win.p,tiles.p,ref.h,ref.w,oy,ox,nx);t2_fold_real<<<blocks(ref.h*ref.w),256,0,stream>>>(tiles.p,out.b.p,ref.h,ref.w,oy,ox,nx);ck(cudaGetLastError());return out;
+    int nx=(ref.w+16+ox)/8+1,ny=(ref.h+16+oy)/8+1,N=nx*ny;Buf<float> var=vars(level,p,oy,ox,coarse),count(scratchPool,size_t(N)*256),tiles(scratchPool,size_t(N)*256);Buf<float2> M(scratchPool,size_t(N)*256);MainArgs args{};std::vector<Buf<long long>> sh;std::vector<Buf<float>> fr;sh.reserve(use.size());fr.reserve(use.size());for(int i:use){sh.emplace_back(scratchPool,2*N);fr.emplace_back(scratchPool,2*N);alignment<<<blocks(2*N),256,0,stream>>>(v[i].p,sh.back().p,fr.back().p,2*N);int j=args.k++;args.img[j]=nb[i]->b.p;args.shift[j]=sh.back().p;args.frac[j]=fr.back().p;}float cnt=float(1+use.size());Buf<float> mergeVar;const float* mergeVariance=var.p;float noiseFactor=float(2*(1-model.planes[p].rho));if(coarse){mergeVar.size(scratchPool,size_t(N)*256);coarse_variance<<<blocks(size_t(N)*256),256,0,stream>>>(var.p,mergeVar.p,N*256,float(model.planes[p].rho));mergeVariance=mergeVar.p;noiseFactor=1.f;}if(strength==1.0){t2_main_merge<<<N,256,0,stream>>>(ref.b.p,win.p,mergeVariance,args,noiseFactor,1/cnt,cnt,coarse?0:!(use.size()>=1&&use.size()<=8),ws.p,coarse?2:0,64,M.p,count.p,tiles.p,ref.h,ref.w,oy,ox,nx);}else{native_t2_main_merge_scaled<<<N,256,0,stream>>>(ref.b.p,win.p,mergeVariance,args,noiseFactor,strength,1/cnt,cnt,coarse?0:!(use.size()>=1&&use.size()<=8),ws.p,coarse?2:0,64,M.p,count.p,tiles.p,ref.h,ref.w,oy,ox,nx);}Image pilot(scratchPool,ref.h,ref.w),out(scratchPool,ref.h,ref.w);t2_fold_real<<<blocks(ref.h*ref.w),256,0,stream>>>(tiles.p,pilot.b.p,ref.h,ref.w,oy,ox,nx);t2_main_wiener<<<N,256,0,stream>>>(M.p,var.p,count.p,basis.p,pilot.b.p,win.p,tiles.p,ref.h,ref.w,oy,ox,nx);t2_fold_real<<<blocks(ref.h*ref.w),256,0,stream>>>(tiles.p,out.b.p,ref.h,ref.w,oy,ox,nx);ck(cudaGetLastError());return out;
 }
 
-void Engine::Impl::s1(std::array<Image,3>& res){for(int p=1;p<3;++p){int H=res[p].h,W=res[p].w;Image g(H,W);pool<<<blocks(H*W),256,0,stream>>>(res[0].b.p,g.b.p,res[0].h,res[0].w,H,W);auto guide=g.b.get(H*W,stream);double mean=std::accumulate(guide.begin(),guide.end(),0.)/guide.size();float sig=float(sigma(model.planes[p],mean)*.5),eps=sig*sig,thr=3*sig;Buf<float> e,t;e.put({eps},stream);t.put({thr},stream);Image a(H,W),b(H,W),out(H,W);ck((cudaError_t)dl_s1_guided(g.b.p,res[p].b.p,e.p,t.p,a.b.p,b.b.p,out.b.p,H,W,device,stream));res[p]=std::move(out);}}
+void Engine::Impl::s1(std::array<Image,3>& res){for(int p=1;p<3;++p){int H=res[p].h,W=res[p].w;Image g(scratchPool,H,W);pool<<<blocks(H*W),256,0,stream>>>(res[0].b.p,g.b.p,res[0].h,res[0].w,H,W);auto guide=g.b.get(H*W,stream);double mean=std::accumulate(guide.begin(),guide.end(),0.)/guide.size();float sig=float(sigma(model.planes[p],mean)*.5),eps=sig*sig,thr=3*sig;Buf<float> e,t;e.put(scratchPool,{eps},stream);t.put(scratchPool,{thr},stream);Image a(scratchPool,H,W),b(scratchPool,H,W),out(scratchPool,H,W);ck((cudaError_t)dl_s1_guided(g.b.p,res[p].b.p,e.p,t.p,a.b.p,b.b.p,out.b.p,H,W,device,stream));res[p]=std::move(out);}}
 
 void Engine::Impl::fit(std::vector<Buf<float>>& v,const std::vector<int>& ks,Source& ref,int oy,int ox){
     // The frozen boundary estimator returns plain vectors until all sixteen direct pairs exist.
     if(mode=="plain"||ks.size()!=16)return;
     int nx=(w+16+ox)/8+1,ny=(h+16+oy)/8+1,N=nx*ny;std::vector<int> inner;for(int j=0;j<N;++j){int x=j%nx*8-8-ox,y=j/nx*8-8-oy;if(x>=32&&w-x>=32&&y>=32&&h-y>=32)inner.push_back(j);}if(inner.empty()){++domainErrors;throw std::runtime_error("T2 fit has no interior tiles");}
-    Buf<float> var=vars(ref.image[0],0,oy,ox,false),lvl(N);Buf<float2> centered(size_t(N)*256),spectra(size_t(N)*256);Buf<double> texture(N);center_tiles<<<N,256,0,stream>>>(ref.image[0].b.p,win.p,centered.p,lvl.p,h,w,oy,ox,nx);t2_fft16_kernel<<<N,256,0,stream>>>(centered.p,spectra.p,N,0);texture_power<<<blocks(N),256,0,stream>>>(spectra.p,var.p,texture.p,N);auto tex=texture.get(N,stream);std::vector<double> vals;for(int j:inner)vals.push_back(tex[j]);double tm=median(vals);std::vector<int> sel;for(int j:inner)if(tex[j]>=tm)sel.push_back(j);
+    Buf<float> var=vars(ref.image[0],0,oy,ox,false),lvl(scratchPool,N);Buf<float2> centered(scratchPool,size_t(N)*256),spectra(scratchPool,size_t(N)*256);Buf<double> texture(scratchPool,N);center_tiles<<<N,256,0,stream>>>(ref.image[0].b.p,win.p,centered.p,lvl.p,h,w,oy,ox,nx);t2_fft16_kernel<<<N,256,0,stream>>>(centered.p,spectra.p,N,0);texture_power<<<blocks(N),256,0,stream>>>(spectra.p,var.p,texture.p,N);auto tex=texture.get(N,stream);std::vector<double> vals;for(int j:inner)vals.push_back(tex[j]);double tm=median(vals);std::vector<int> sel;for(int j:inner)if(tex[j]>=tm)sel.push_back(j);
     std::vector<std::vector<float>> V;for(auto& a:v)V.push_back(a.get(2*N,stream));std::array<std::array<double,2>,16> g{};
     for(int k=0;k<16;++k)for(int ax=0;ax<2;++ax){std::vector<double> y;for(int j:sel)y.push_back(V[k][2*j+ax]);double beta=median(y);std::vector<double> res(y.size()),dev(y.size()),wt(y.size());auto scale=[&](){for(size_t j=0;j<y.size();++j)res[j]=y[j]-beta;double med=median(res);for(size_t j=0;j<y.size();++j)dev[j]=std::abs(res[j]-med);double s=std::max(1e-4,1.4826*median(dev));for(size_t j=0;j<y.size();++j)wt[j]=std::min(1.,1.345*s/std::max(std::abs(res[j]),1e-12));};scale();for(int it=0;it<21;++it){double num=0,den=1e-9;for(size_t j=0;j<y.size();++j){num+=wt[j]*y[j];den+=wt[j];}beta=num/den;scale();}g[k][ax]=beta;}
     // Symmetric full16 quadratic design has diagonal odd part and a 2x2 even block.
     double K=16,sum2=0,sum4=0;for(int k:ks){sum2+=k*k;sum4+=double(k)*k*k*k;}double det=K*sum4-sum2*sum2;std::vector<double> s2(N),s2c(N),weight(N),sig(N);for(int j=0;j<N;++j){double rss=0;for(int ax=0;ax<2;++ax){double b0=0,b1=0,b2=0;for(int i=0;i<16;++i){double z=double(V[i][2*j+ax])-g[i][ax];b0+=z;b1+=ks[i]*z;b2+=ks[i]*ks[i]*z;}double c=(sum4*b0-sum2*b2)/det,u=b1/sum2,a=(K*b2-sum2*b0)/det;for(int i=0;i<16;++i){double z=double(V[i][2*j+ax])-g[i][ax]-c-u*ks[i]-a*ks[i]*ks[i];rss+=z*z;}}s2[j]=rss/26;}
     vals.clear();for(int j:sel)if(tex[j]>0)vals.push_back(s2[j]*tex[j]);double ac;if(!vals.empty())ac=median(vals);else {std::vector<double> a,b;for(int j:inner){a.push_back(s2[j]);b.push_back(std::max(1.,tex[j]));}ac=median(a)*median(b);}vals.clear();for(int j:sel)vals.push_back(tex[j]);double floor=.05*std::max(1e-9,median(vals));for(int j=0;j<N;++j){s2c[j]=std::max(1e-6,(26*std::max(1e-6,s2[j])+8*ac/std::max(floor,tex[j]))/34);sig[j]=std::sqrt(s2c[j]);}for(int j:inner)weight[j]=1/s2c[j];
     std::vector<int> targets;for(int i=0;i<16;++i)if(mode=="full"||std::abs(ks[i])<=2)targets.push_back(i);int B=int(targets.size());std::vector<double> Y(size_t(B)*2*N),W(size_t(B)*N),S(size_t(B)*N),m(B),inv(size_t(B)*N);for(int b=0;b<B;++b){int k=targets[b];for(int j=0;j<N;++j){for(int ax=0;ax<2;++ax)Y[(b*2+ax)*N+j]=double(V[k][2*j+ax])-g[k][ax];W[b*N+j]=weight[j];S[b*N+j]=sig[j];}}
-    Buf<double> dy,dw,ds,dz(size_t(B)*N);dy.put(Y,stream);dw.put(W,stream);ds.put(S,stream);ck((cudaError_t)dl_t2_scale_z2(dy.p,dw.p,ds.p,dz.p,B,ny,nx,stream));auto z=dz.get(size_t(B)*N,stream);for(int b=0;b<B;++b){std::vector<double> row(z.begin()+b*N,z.begin()+(b+1)*N);double med=median(row);m[b]=std::max(.05,(std::isfinite(med)?med:1.)/(2*std::log(2.)));for(int j=0;j<N;++j){double scale=(4.685*sig[j])*std::sqrt(m[b]);inv[b*N+j]=1/(scale*scale);}}
+    Buf<double> dy,dw,ds,dz(scratchPool,size_t(B)*N);dy.put(scratchPool,Y,stream);dw.put(scratchPool,W,stream);ds.put(scratchPool,S,stream);ck((cudaError_t)dl_t2_scale_z2(dy.p,dw.p,ds.p,dz.p,B,ny,nx,stream));auto z=dz.get(size_t(B)*N,stream);for(int b=0;b<B;++b){std::vector<double> row(z.begin()+b*N,z.begin()+(b+1)*N);double med=median(row);m[b]=std::max(.05,(std::isfinite(med)?med:1.)/(2*std::log(2.)));for(int j=0;j<N;++j){double scale=(4.685*sig[j])*std::sqrt(m[b]);inv[b*N+j]=1/(scale*scale);}}
     bool domain=true;for(double x:Y)domain&=std::isfinite(x)&&std::abs(x)<=1e6;for(double x:weight)domain&=std::isfinite(x)&&(x==0||(x>=1e-12&&x<=1e6));for(double x:sig)domain&=std::isfinite(x)&&x>=1e-3&&x<=1e6;for(double x:m)domain&=std::isfinite(x)&&x>=.05&&x<=1e20;if(!domain){trace_buffer(dy,Y.size(),"domain-Y.f64",stream);std::ostringstream why;auto range=[&](const char* name,const std::vector<double>& a){auto mm=std::minmax_element(a.begin(),a.end());why<<" "<<name<<"=["<<*mm.first<<","<<*mm.second<<"]";};range("Y",Y);range("W",weight);range("sig",sig);range("m",m);why<<" tex_median="<<tm<<" confidence_a="<<ac;domainNote=why.str();bool safe=true;for(double x:Y)safe&=std::isfinite(x)&&std::isfinite(x*x);for(double x:weight)safe&=std::isfinite(x)&&x>=0;for(double x:sig)safe&=std::isfinite(x)&&x>0;for(double x:m)safe&=std::isfinite(x)&&x>0;for(double x:inv)safe&=std::isfinite(x)&&x>0;if(!safe){++domainErrors;throw std::runtime_error("T2 input outside finite native FP64 fit domain:"+domainNote);}++fp32DomainExits;}
-    Buf<double> dinv,dm,sharedW;dinv.put(inv,stream);dm.put(m,stream);sharedW.put(weight,stream);std::vector<std::vector<Buf<float>>> candidates(6);int radii[]={24,12,6,3,2,1};for(int c=0;c<6;++c){int r=radii[c];Buf<double> out(size_t(B)*2*N);if(!domain){if(mode=="box"){Buf<double> scratch(size_t(8)*B*N);Buf<unsigned char> good(size_t(B)*N);ck((cudaError_t)dl_t2_native_boxfit_fp64(dy.p,sharedW.p,dinv.p,out.p,scratch.p,good.p,B,ny,nx,r,6,stream));++fp64BoxFits;}else {std::vector<double> G((2*r+1)*(2*r+1)),seed(size_t(B)*N*2);std::vector<unsigned char> valid(size_t(B)*N);double ss=std::max(.5*r,.6);for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)G[(y+r)*(2*r+1)+x+r]=std::exp(-(x*x+y*y)/(2*ss*ss));int error=dl_t2_native_median_seed64_host(Y.data(),W.data(),seed.data(),valid.data(),B,ny,nx,r);if(error)throw std::runtime_error("T2 invalid FP64 median-seed descriptor");Buf<double> dg,beta;dg.put(G,stream);beta.put(seed,stream);Buf<bool> finite(size_t(B)*N);std::unique_ptr<bool[]> hostFinite(new bool[size_t(B)*N]);for(size_t i=0;i<size_t(B)*N;++i)hostFinite[i]=valid[i]!=0;ck(cudaMemcpyAsync(finite.p,hostFinite.get(),sizeof(bool)*B*N,cudaMemcpyHostToDevice,stream));ck((cudaError_t)dl_t2_field_constant(dy.p,dw.p,ds.p,dm.p,dg.p,beta.p,finite.p,out.p,dinv.p,B,2,ny,nx,r,6,1,0.,4.685,stream));ck(cudaStreamSynchronize(stream));++fp64LocalFits;}}else if(mode=="box"){Buf<float> scratch(size_t(8)*B*N);Buf<unsigned char> good(size_t(B)*N);ck((cudaError_t)dl_t2_boxfit_f32(dy.p,sharedW.p,dinv.p,out.p,scratch.p,good.p,B,ny,nx,r,6,stream));}else {std::vector<float> G((2*r+1)*(2*r+1));double ss=std::max(.5*r,.6);for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)G[(y+r)*(2*r+1)+x+r]=float(std::exp(-(x*x+y*y)/(2*ss*ss)));Buf<float> dg;dg.put(G,stream);Buf<float4> scratch(size_t(B)*N);ck((cudaError_t)dl_t2_field_tiled_f32_rs(dy.p,dw.p,ds.p,dm.p,dg.p,dinv.p,out.p,scratch.p,B,ny,nx,r,6,0,4.685,stream));}auto result=out.get(size_t(B)*2*N,stream);for(int b=0;b<B;++b){std::vector<float> cv(2*N);for(int j=0;j<N;++j)for(int ax=0;ax<2;++ax)cv[2*j+ax]=float(result[(b*2+ax)*N+j]+g[targets[b]][ax]);Buf<float> d;d.put(cv,stream);candidates[c].push_back(std::move(d));}}
-    for(int b=0;b<B;++b){int k=targets[b];std::array<std::vector<float>,7> energies;Source& nb=ring[(ref.index+ks[k])%17];for(int c=0;c<7;++c){Buf<float> e(N);score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:candidates[c-1][b].p,win.p,var.p,e.p,h,w,oy,ox,nx);energies[c]=e.get(N,stream);}std::array<std::vector<float>,6> hostCandidates;for(int c=0;c<6;++c)hostCandidates[c]=candidates[c][b].get(2*N,stream);auto chosen=hostCandidates[0];for(int j:inner){float best=energies[0][j];for(int c=1;c<7;++c)best=std::min(best,energies[c][j]);int choice=0;for(int c=1;c<7;++c)if((double(energies[c][j])-double(best))*255<=-2*std::log(.001)){choice=c;break;}if(choice==0){chosen[2*j]=V[k][2*j];chosen[2*j+1]=V[k][2*j+1];}else {const auto& cv=hostCandidates[choice-1];chosen[2*j]=cv[2*j];chosen[2*j+1]=cv[2*j+1];}}v[k].put(chosen,stream);++refined;}
+    Buf<double> dinv,dm,sharedW;dinv.put(scratchPool,inv,stream);dm.put(scratchPool,m,stream);sharedW.put(scratchPool,weight,stream);std::vector<std::vector<Buf<float>>> candidates(6);int radii[]={24,12,6,3,2,1};for(int c=0;c<6;++c){int r=radii[c];Buf<double> out(scratchPool,size_t(B)*2*N);if(!domain){if(mode=="box"){Buf<double> scratch(scratchPool,size_t(8)*B*N);Buf<unsigned char> good(scratchPool,size_t(B)*N);ck((cudaError_t)dl_t2_native_boxfit_fp64(dy.p,sharedW.p,dinv.p,out.p,scratch.p,good.p,B,ny,nx,r,6,stream));++fp64BoxFits;}else {std::vector<double> G((2*r+1)*(2*r+1)),seed(size_t(B)*N*2);std::vector<unsigned char> valid(size_t(B)*N);double ss=std::max(.5*r,.6);for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)G[(y+r)*(2*r+1)+x+r]=std::exp(-(x*x+y*y)/(2*ss*ss));int error=dl_t2_native_median_seed64_host(Y.data(),W.data(),seed.data(),valid.data(),B,ny,nx,r);if(error)throw std::runtime_error("T2 invalid FP64 median-seed descriptor");Buf<double> dg,beta;dg.put(scratchPool,G,stream);beta.put(scratchPool,seed,stream);Buf<bool> finite(scratchPool,size_t(B)*N);std::unique_ptr<bool[]> hostFinite(new bool[size_t(B)*N]);for(size_t i=0;i<size_t(B)*N;++i)hostFinite[i]=valid[i]!=0;ck(cudaMemcpyAsync(finite.p,hostFinite.get(),sizeof(bool)*B*N,cudaMemcpyHostToDevice,stream));ck((cudaError_t)dl_t2_field_constant(dy.p,dw.p,ds.p,dm.p,dg.p,beta.p,finite.p,out.p,dinv.p,B,2,ny,nx,r,6,1,0.,4.685,stream));ck(cudaStreamSynchronize(stream));++fp64LocalFits;}}else if(mode=="box"){Buf<float> scratch(scratchPool,size_t(8)*B*N);Buf<unsigned char> good(scratchPool,size_t(B)*N);ck((cudaError_t)dl_t2_boxfit_f32(dy.p,sharedW.p,dinv.p,out.p,scratch.p,good.p,B,ny,nx,r,6,stream));}else {std::vector<float> G((2*r+1)*(2*r+1));double ss=std::max(.5*r,.6);for(int y=-r;y<=r;++y)for(int x=-r;x<=r;++x)G[(y+r)*(2*r+1)+x+r]=float(std::exp(-(x*x+y*y)/(2*ss*ss)));Buf<float> dg;dg.put(scratchPool,G,stream);Buf<float4> scratch(scratchPool,size_t(B)*N);ck((cudaError_t)dl_t2_field_tiled_f32_rs(dy.p,dw.p,ds.p,dm.p,dg.p,dinv.p,out.p,scratch.p,B,ny,nx,r,6,0,4.685,stream));}auto result=out.get(size_t(B)*2*N,stream);for(int b=0;b<B;++b){std::vector<float> cv(2*N);for(int j=0;j<N;++j)for(int ax=0;ax<2;++ax)cv[2*j+ax]=float(result[(b*2+ax)*N+j]+g[targets[b]][ax]);Buf<float> d;d.put(scratchPool,cv,stream);candidates[c].push_back(std::move(d));}}
+    for(int b=0;b<B;++b){int k=targets[b];std::array<std::vector<float>,7> energies;Source& nb=ring[(ref.index+ks[k])%17];for(int c=0;c<7;++c){Buf<float> e(scratchPool,N);score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:candidates[c-1][b].p,win.p,var.p,e.p,h,w,oy,ox,nx);energies[c]=e.get(N,stream);}std::array<std::vector<float>,6> hostCandidates;for(int c=0;c<6;++c)hostCandidates[c]=candidates[c][b].get(2*N,stream);auto chosen=hostCandidates[0];for(int j:inner){float best=energies[0][j];for(int c=1;c<7;++c)best=std::min(best,energies[c][j]);int choice=0;for(int c=1;c<7;++c)if((double(energies[c][j])-double(best))*255<=-2*std::log(.001)){choice=c;break;}if(choice==0){chosen[2*j]=V[k][2*j];chosen[2*j+1]=V[k][2*j+1];}else {const auto& cv=hostCandidates[choice-1];chosen[2*j]=cv[2*j];chosen[2*j+1]=cv[2*j+1];}}v[k].put(scratchPool,chosen,stream);++refined;}
 }
 
 void Engine::Impl::render(int64_t index,int64_t received,const FrameView& out){Source& ref=ring[index%17];if(ref.index!=index)throw std::runtime_error("T2 stale source slot");int oy=1+int(index*3%7),ox=1+int((index*5+2)%7);std::vector<int> ks;std::vector<Buf<float>> v,dense;for(int k=-8;k<=8;++k)if(k&&index+k>=0&&index+k<received){Source& nb=ring[(index+k)%17];if(nb.index!=index+k)throw std::runtime_error("T2 stale neighbour slot");ks.push_back(k);dense.emplace_back();v.push_back(motion(ref,nb,oy,ox,&dense.back()));}if(index==4){for(int i=0;i<int(ks.size());++i){trace_buffer(v[i],v[i].n,"vectors-"+std::to_string(ks[i])+".f32",stream);trace_buffer(dense[i],dense[i].n,"flow-"+std::to_string(ks[i])+".f32",stream);}}fit(v,ks,ref,oy,ox);std::vector<int> nearby,all;for(int i=0;i<int(ks.size());++i){all.push_back(i);if(std::abs(ks[i])<=2)nearby.push_back(i);}std::array<Image,3> res,longRes;int lnx=(w+16+ox)/8+1,lny=(h+16+oy)/8+1;
-    for(int p=0;p<3;++p){int X=p?sx:1,Y=p?sy:1,H=ref.image[p].h,W=ref.image[p].w,N=((W+16+ox)/8+1)*((H+16+oy)/8+1);std::vector<Buf<float>> pv;std::vector<const Image*> nb;for(int i=0;i<int(ks.size());++i){nb.push_back(&ring[(index+ks[i])%17].image[p]);Buf<float> d(2*N);if(!p)ck(cudaMemcpyAsync(d.p,v[i].p,2*N*sizeof(float),cudaMemcpyDeviceToDevice,stream));else if(mode!="plain"&&ks.size()==16)plane_vectors<<<blocks(2*N),256,0,stream>>>(v[i].p,d.p,H,W,h,w,X,Y,oy,ox,(W+16+ox)/8+1,lnx,lny,N);else {
-            Buf<float> full(size_t(2)*h*w),native(size_t(2)*H*W);
-            resize_flow<<<blocks(2*h*w),256,0,stream>>>(dense[i].p,full.p,h/4,w/4,h,w,0,float(w)/(w/4),float(h)/(h/4));
-            resize_flow<<<blocks(2*H*W),256,0,stream>>>(full.p,native.p,h,w,H,W,0,1.f/X,1.f/Y);
-            tile_vectors<<<blocks(2*N),256,0,stream>>>(native.p,d.p,H,W,H,W,oy,ox,(W+16+ox)/8+1,N);
-        }pv.push_back(std::move(d));}Image level(H,W);pool<<<blocks(H*W),256,0,stream>>>(ref.image[0].b.p,level.b.p,h,w,H,W);res[p]=reconstruction(ref.image[p],nb,pv,nearby,level,p,oy,ox,false);if(mode=="full")longRes[p]=reconstruction(ref.image[p],nb,pv,all,level,p,oy,ox,false);}
+    const bool fullWindow = mode == "full";
+    {
+        // Both chroma planes have the same sampling, grid and motion vectors.
+        // Keep neighbour indexing for reconstruction; the coarse pass uses v directly.
+        const int chromaH = ref.image[1].h, chromaW = ref.image[1].w;
+        const int chromaNx = (chromaW + 16 + ox) / 8 + 1;
+        const int chromaTiles = chromaNx * ((chromaH + 16 + oy) / 8 + 1);
+        const bool fittedChroma = mode != "plain" && ks.size() == 16;
+        const auto& chromaWindow = fullWindow ? all : nearby;
+        std::vector<Buf<float>> chromaVectors(ks.size());
+        for (int i : chromaWindow) {
+            auto& vectors = chromaVectors[i];
+            vectors.size(scratchPool, 2 * chromaTiles);
+            if (fittedChroma) {
+                plane_vectors<<<blocks(2 * chromaTiles),256,0,stream>>>(v[i].p,vectors.p,chromaH,chromaW,h,w,sx,sy,oy,ox,chromaNx,lnx,lny,chromaTiles);
+            } else {
+                Buf<float> full(scratchPool,size_t(2)*h*w),native(scratchPool,size_t(2)*chromaH*chromaW);
+                resize_flow<<<blocks(2*h*w),256,0,stream>>>(dense[i].p,full.p,h/4,w/4,h,w,0,float(w)/(w/4),float(h)/(h/4));
+                resize_flow<<<blocks(2*chromaH*chromaW),256,0,stream>>>(full.p,native.p,h,w,chromaH,chromaW,0,1.f/sx,1.f/sy);
+                tile_vectors<<<blocks(2 * chromaTiles),256,0,stream>>>(native.p,vectors.p,chromaH,chromaW,chromaH,chromaW,oy,ox,chromaNx,chromaTiles);
+            }
+        }
+
+        for (int p = 0; p < 3; ++p) {
+            const int H = ref.image[p].h, W = ref.image[p].w;
+            const auto& vectors = p == 0 ? v : chromaVectors;
+            std::vector<const Image*> neighbours;
+            neighbours.reserve(ks.size());
+            for (int k : ks) neighbours.push_back(&ring[(index + k) % 17].image[p]);
+            Image level(scratchPool,H,W);
+            pool<<<blocks(H*W),256,0,stream>>>(ref.image[0].b.p,level.b.p,h,w,H,W);
+            res[p] = reconstruction(ref.image[p],neighbours,vectors,nearby,level,p,oy,ox,false);
+            if (fullWindow) longRes[p] = reconstruction(ref.image[p],neighbours,vectors,all,level,p,oy,ox,false);
+        }
+    }
     s1(res);if(mode=="full"){s1(longRes);for(int p=0;p<3;++p){ // Preserve long-main coarse-band selection before coarse replacement.
-        int H=res[p].h,W=res[p].w,hp=H+64,wp=W+64;Image delta(H,W);ck(cudaMemcpyAsync(delta.b.p,longRes[p].b.p,H*W*sizeof(float),cudaMemcpyDeviceToDevice,stream));subtract<<<blocks(H*W),256,0,stream>>>(delta.b.p,res[p].b.p,H*W);Buf<float2> spec(size_t(hp)*wp);pad_complex<<<blocks(hp*wp),256,0,stream>>>(delta.b.p,spec.p,H,W,hp,wp,32,32);fft(spec,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(spec.p,hp,wp,p?sx:1,p?sy:1,0);fft(spec,hp,wp,true);crop_add<<<blocks(H*W),256,0,stream>>>(res[p].b.p,spec.p,H,W,hp,wp,32,32);
+        int H=res[p].h,W=res[p].w,hp=H+64,wp=W+64;Image delta(scratchPool,H,W);ck(cudaMemcpyAsync(delta.b.p,longRes[p].b.p,H*W*sizeof(float),cudaMemcpyDeviceToDevice,stream));subtract<<<blocks(H*W),256,0,stream>>>(delta.b.p,res[p].b.p,H*W);Buf<float2> spec(scratchPool,size_t(hp)*wp);pad_complex<<<blocks(hp*wp),256,0,stream>>>(delta.b.p,spec.p,H,W,hp,wp,32,32);fft(spec,hp,wp,false);spectral_gain<<<blocks(hp*wp),256,0,stream>>>(spec.p,hp,wp,p?sx:1,p?sy:1,0);fft(spec,hp,wp,true);crop_add<<<blocks(H*W),256,0,stream>>>(res[p].b.p,spec.p,H,W,hp,wp,32,32);
     }}
-    int hc=ref.coarse[0].h,wc=ref.coarse[0].w,ncx=(wc+16+ox)/8+1,ncy=(hc+16+oy)/8+1;std::vector<Buf<float>> cv;for(auto& a:v){Image cg(hc,wc);cg.b.size(size_t(2)*hc*wc);ck((cudaError_t)dl_coarse_gather(a.p,cg.b.p,h,w,oy,ox,lny,lnx,hc,wc,34,device,stream));Buf<float> vec(2*ncx*ncy);tile_vectors<<<blocks(2*ncx*ncy),256,0,stream>>>(cg.b.p,vec.p,hc,wc,hc,wc,oy,ox,ncx,ncx*ncy);divide<<<blocks(2*ncx*ncy),256,0,stream>>>(vec.p,2*ncx*ncy,4);cv.push_back(std::move(vec));}for(int p=0;p<3;++p){std::vector<const Image*> nb;for(int k:ks)nb.push_back(&ring[(index+k)%17].coarse[p]);Image c=reconstruction(ref.coarse[p],nb,cv,all,ref.coarse[0],p,oy,ox,true);recombine(res[p],c,p?sx:1,p?sy:1);write_plane<<<blocks(res[p].h*res[p].w),256,0,stream>>>(out.plane[p],res[p].b.p);}ck(cudaGetLastError());++frames;
+    int hc=ref.coarse[0].h,wc=ref.coarse[0].w,ncx=(wc+16+ox)/8+1,ncy=(hc+16+oy)/8+1;std::vector<Buf<float>> cv;for(auto& a:v){Image cg(scratchPool,hc,wc);cg.b.size(scratchPool,size_t(2)*hc*wc);ck((cudaError_t)dl_coarse_gather(a.p,cg.b.p,h,w,oy,ox,lny,lnx,hc,wc,34,device,stream));Buf<float> vec(scratchPool,2*ncx*ncy);tile_vectors<<<blocks(2*ncx*ncy),256,0,stream>>>(cg.b.p,vec.p,hc,wc,hc,wc,oy,ox,ncx,ncx*ncy);divide<<<blocks(2*ncx*ncy),256,0,stream>>>(vec.p,2*ncx*ncy,4);cv.push_back(std::move(vec));}for(int p=0;p<3;++p){std::vector<const Image*> nb;for(int k:ks)nb.push_back(&ring[(index+k)%17].coarse[p]);Image c=reconstruction(ref.coarse[p],nb,cv,all,ref.coarse[0],p,oy,ox,true);recombine(res[p],c,p?sx:1,p?sy:1);write_plane<<<blocks(res[p].h*res[p].w),256,0,stream>>>(out.plane[p],res[p].b.p);}ck(cudaGetLastError());++frames;
 }
 Engine::Engine(int w,int h,int sx,int sy,const std::string& mode,Model model,double strength):p(new Impl(w,h,sx,sy,mode,std::move(model),strength)){if(!std::isfinite(strength)||strength<0)throw std::runtime_error("MCWiener strength must be finite and nonnegative (lab c)");if(w<68||h<68||w%4||h%4)throw std::runtime_error("T2 requires dimensions >=68 and divisible by four");if(mode!="plain"&&mode!="box"&&mode!="full")throw std::runtime_error("T2 unknown mode");}
 Engine::~Engine()=default;
