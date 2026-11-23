@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <cstdlib>
+#include <cstdio>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_reduce.cuh>
 // These sources are verbatim copies of the validated lab launchers. See PROVENANCE.md.
@@ -129,6 +130,7 @@ private:
     ScratchPool::Block* block_ = nullptr;
 };
 struct Image { int h=0,w=0; Buf<float> b; Image()=default; Image(ScratchPool& pool,int hh,int ww):h(hh),w(ww),b(pool,size_t(hh)*ww){} };
+#include "t2_box_fit_device.cuh"
 static int blocks(size_t n){return int((n+255)/256);}
 template<class T> static void trace_buffer(const Buf<T>& b,size_t n,const std::string& name,cudaStream_t stream){const char* dir=std::getenv("T2_NATIVE_TRACE");if(!dir)return;auto v=b.get(n,stream);std::ofstream f(std::string(dir)+"/"+name,std::ios::binary);if(!f)throw std::runtime_error("T2 diagnostic trace path unavailable");f.write((const char*)v.data(),v.size()*sizeof(T));}
 constexpr double PI=3.14159265358979323846;
@@ -250,7 +252,12 @@ void Engine::Impl::fit(std::vector<Buf<float>>& v,const std::vector<int>& ks,Sou
     int nx=(w+16+ox)/8+1,ny=(h+16+oy)/8+1,N=nx*ny;std::vector<int> inner;for(int j=0;j<N;++j){int x=j%nx*8-8-ox,y=j/nx*8-8-oy;if(x>=32&&w-x>=32&&y>=32&&h-y>=32)inner.push_back(j);}if(inner.empty()){++domainErrors;throw std::runtime_error("T2 fit has no interior tiles");}
     Buf<float> var=vars(ref.image[0],0,oy,ox,false),lvl(scratchPool,N);Buf<float2> centered(scratchPool,size_t(N)*256),spectra(scratchPool,size_t(N)*256);Buf<double> texture(scratchPool,N);center_tiles<<<N,256,0,stream>>>(ref.image[0].b.p,win.p,centered.p,lvl.p,h,w,oy,ox,nx);t2_fft16_kernel<<<N,256,0,stream>>>(centered.p,spectra.p,N,0);texture_power<<<blocks(N),256,0,stream>>>(spectra.p,var.p,texture.p,N);auto tex=texture.get(N,stream);std::vector<double> vals;for(int j:inner)vals.push_back(tex[j]);double tm=median(vals);std::vector<int> sel;for(int j:inner)if(tex[j]>=tm)sel.push_back(j);
     std::vector<std::vector<float>> V;for(auto& a:v)V.push_back(a.get(2*N,stream));std::array<std::array<double,2>,16> g{};
+    static const bool hostFit=std::getenv("T2_NATIVE_HOSTFIT")!=nullptr,fitCheck=std::getenv("T2_NATIVE_FITCHECK")!=nullptr;
+    if(!hostFit)huber_translations_device(scratchPool,stream,v,sel,g);
+    if(hostFit||fitCheck){auto gd=g;
     for(int k=0;k<16;++k)for(int ax=0;ax<2;++ax){std::vector<double> y;for(int j:sel)y.push_back(V[k][2*j+ax]);double beta=median(y);std::vector<double> res(y.size()),dev(y.size()),wt(y.size());auto scale=[&](){for(size_t j=0;j<y.size();++j)res[j]=y[j]-beta;double med=median(res);for(size_t j=0;j<y.size();++j)dev[j]=std::abs(res[j]-med);double s=std::max(1e-4,1.4826*median(dev));for(size_t j=0;j<y.size();++j)wt[j]=std::min(1.,1.345*s/std::max(std::abs(res[j]),1e-12));};scale();for(int it=0;it<21;++it){double num=0,den=1e-9;for(size_t j=0;j<y.size();++j){num+=wt[j]*y[j];den+=wt[j];}beta=num/den;scale();}g[k][ax]=beta;}
+    if(fitCheck){double m=0;for(int k=0;k<16;++k)for(int ax=0;ax<2;++ax)m=std::max(m,std::abs(g[k][ax]-gd[k][ax]));fprintf(stderr,"T2FITCHECK frame=%lld g_maxabs_diff=%.3e\n",(long long)ref.index,m);g=gd;}
+    }
     // Symmetric full16 quadratic design has diagonal odd part and a 2x2 even block.
     double K=16,sum2=0,sum4=0;for(int k:ks){sum2+=k*k;sum4+=double(k)*k*k*k;}double det=K*sum4-sum2*sum2;std::vector<double> s2(N),s2c(N),weight(N),sig(N);for(int j=0;j<N;++j){double rss=0;for(int ax=0;ax<2;++ax){double b0=0,b1=0,b2=0;for(int i=0;i<16;++i){double z=double(V[i][2*j+ax])-g[i][ax];b0+=z;b1+=ks[i]*z;b2+=ks[i]*ks[i]*z;}double c=(sum4*b0-sum2*b2)/det,u=b1/sum2,a=(K*b2-sum2*b0)/det;for(int i=0;i<16;++i){double z=double(V[i][2*j+ax])-g[i][ax]-c-u*ks[i]-a*ks[i]*ks[i];rss+=z*z;}}s2[j]=rss/26;}
     vals.clear();for(int j:sel)if(tex[j]>0)vals.push_back(s2[j]*tex[j]);double ac;if(!vals.empty())ac=median(vals);else {std::vector<double> a,b;for(int j:inner){a.push_back(s2[j]);b.push_back(std::max(1.,tex[j]));}ac=median(a)*median(b);}vals.clear();for(int j:sel)vals.push_back(tex[j]);double floor=.05*std::max(1e-9,median(vals));for(int j=0;j<N;++j){s2c[j]=std::max(1e-6,(26*std::max(1e-6,s2[j])+8*ac/std::max(floor,tex[j]))/34);sig[j]=std::sqrt(s2c[j]);}for(int j:inner)weight[j]=1/s2c[j];
