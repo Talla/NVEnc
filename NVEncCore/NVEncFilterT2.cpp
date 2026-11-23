@@ -1,5 +1,6 @@
 // Native T2 VPP. used_by: NVEncCore.cpp; rules: explicit extended model, native geometry,
-// owned FP32 ring, >=10-bit output, delayed originating metadata and complete EOS drain.
+// owned FP32 ring, native-depth surfaces, delayed originating metadata and complete EOS drain.
+// agent: codex-gpt-6 | 2026-11-23 | Clarify that encoding depth is chosen after the native filter.
 #include "NVEncFilterT2.h"
 #include "rgy_util.h"
 #include "convert_csp.h"

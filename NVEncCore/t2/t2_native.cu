@@ -1,6 +1,9 @@
 // Native translation of the frozen T2 plain/box/full orchestration (2026-10-20).
 // used_by: NVEncFilterT2.cpp; rules: source samples never prefiltered for reconstruction,
 // FP32 image accumulation, FP64 fit ABI, owned 17-slot history, caller's persistent stream.
+// Scratch leases are ordered on that stream. Chroma vectors are shared across planes;
+// only HQ consumes the full main reconstruction window. Coarse motion retains all neighbours.
+// agent: codex-gpt-6 | 2026-11-23 | Reuse CUDA scratch buffers and share chroma motion maps.
 #include "t2_native.h"
 #include <cufft.h>
 #include <algorithm>

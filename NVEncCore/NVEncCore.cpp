@@ -3057,13 +3057,9 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     const auto resize = std::make_pair(resizeWidth, resizeHeight);
 
     std::vector<std::unique_ptr<NVEncFilter>> vppCUDAFilters;
-    // T2 consumes the original native sampling/code domain before colorspace/crop/resize.
-    // All subsequent filters retain their established layout negotiation.
+    // T2 consumes the original native sampling/code domain. The subsequent
+    // conversion filters negotiate the encoder's chroma and bit depth.
     if(inputParam->vpp.t2.enable) {
-        if(RGY_CSP_BIT_DEPTH[GetEncoderCSP(inputParam)] < 10) {
-            PrintMes(RGY_LOG_ERROR,_T("T2 requires >=10-bit output; use --output-depth 10.\n"));
-            return RGY_ERR_INVALID_PARAM;
-        }
         auto err=AddFilterCUDA(vppCUDAFilters,inputFrame,VppType::CL_T2,inputParam,inputCrop,resize,VuiFiltered);
         if(err!=RGY_ERR_NONE)return err;
     }
