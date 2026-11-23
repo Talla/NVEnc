@@ -17,6 +17,7 @@
 #include <fstream>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_reduce.cuh>
 // These sources are verbatim copies of the validated lab launchers. See PROVENANCE.md.
@@ -201,6 +202,7 @@ struct Engine::Impl {
     Image reconstruction(const Image& ref,const std::vector<const Image*>& neighbours,const std::vector<Buf<float>>& v,const std::vector<int>& use,const Image& levelImage,int p,int oy,int ox,bool coarse);
     void s1(std::array<Image,3>& res);
     void fit(std::vector<Buf<float>>& v,const std::vector<int>& ks,Source& ref,int oy,int ox);
+    bool fit_box_device(std::vector<Buf<float>>& v,const std::vector<int>& ks,Source& ref,int oy,int ox,int level);
     void render(int64_t index,int64_t received,const FrameView& out);
 };
 
@@ -249,6 +251,8 @@ void Engine::Impl::s1(std::array<Image,3>& res){for(int p=1;p<3;++p){int H=res[p
 void Engine::Impl::fit(std::vector<Buf<float>>& v,const std::vector<int>& ks,Source& ref,int oy,int ox){
     // The frozen boundary estimator returns plain vectors until all sixteen direct pairs exist.
     if(mode=="plain"||ks.size()!=16)return;
+    static const int fixLevel=std::getenv("T2_NATIVE_FIXLEVEL")?std::atoi(std::getenv("T2_NATIVE_FIXLEVEL")):4;
+    if(fixLevel>=2&&mode=="box"&&fit_box_device(v,ks,ref,oy,ox,fixLevel))return;
     int nx=(w+16+ox)/8+1,ny=(h+16+oy)/8+1,N=nx*ny;std::vector<int> inner;for(int j=0;j<N;++j){int x=j%nx*8-8-ox,y=j/nx*8-8-oy;if(x>=32&&w-x>=32&&y>=32&&h-y>=32)inner.push_back(j);}if(inner.empty()){++domainErrors;throw std::runtime_error("T2 fit has no interior tiles");}
     Buf<float> var=vars(ref.image[0],0,oy,ox,false),lvl(scratchPool,N);Buf<float2> centered(scratchPool,size_t(N)*256),spectra(scratchPool,size_t(N)*256);Buf<double> texture(scratchPool,N);center_tiles<<<N,256,0,stream>>>(ref.image[0].b.p,win.p,centered.p,lvl.p,h,w,oy,ox,nx);t2_fft16_kernel<<<N,256,0,stream>>>(centered.p,spectra.p,N,0);texture_power<<<blocks(N),256,0,stream>>>(spectra.p,var.p,texture.p,N);auto tex=texture.get(N,stream);std::vector<double> vals;for(int j:inner)vals.push_back(tex[j]);double tm=median(vals);std::vector<int> sel;for(int j:inner)if(tex[j]>=tm)sel.push_back(j);
     std::vector<std::vector<float>> V;for(auto& a:v)V.push_back(a.get(2*N,stream));std::array<std::array<double,2>,16> g{};
@@ -268,6 +272,7 @@ void Engine::Impl::fit(std::vector<Buf<float>>& v,const std::vector<int>& ks,Sou
     for(int b=0;b<B;++b){int k=targets[b];std::array<std::vector<float>,7> energies;Source& nb=ring[(ref.index+ks[k])%17];for(int c=0;c<7;++c){Buf<float> e(scratchPool,N);score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:candidates[c-1][b].p,win.p,var.p,e.p,h,w,oy,ox,nx);energies[c]=e.get(N,stream);}std::array<std::vector<float>,6> hostCandidates;for(int c=0;c<6;++c)hostCandidates[c]=candidates[c][b].get(2*N,stream);auto chosen=hostCandidates[0];for(int j:inner){float best=energies[0][j];for(int c=1;c<7;++c)best=std::min(best,energies[c][j]);int choice=0;for(int c=1;c<7;++c)if((double(energies[c][j])-double(best))*255<=-2*std::log(.001)){choice=c;break;}if(choice==0){chosen[2*j]=V[k][2*j];chosen[2*j+1]=V[k][2*j+1];}else {const auto& cv=hostCandidates[choice-1];chosen[2*j]=cv[2*j];chosen[2*j+1]=cv[2*j+1];}}v[k].put(scratchPool,chosen,stream);++refined;}
 }
 
+#include "t2_box_fit_impl.cuh"
 void Engine::Impl::render(int64_t index,int64_t received,const FrameView& out){Source& ref=ring[index%17];if(ref.index!=index)throw std::runtime_error("T2 stale source slot");int oy=1+int(index*3%7),ox=1+int((index*5+2)%7);std::vector<int> ks;std::vector<Buf<float>> v,dense;for(int k=-8;k<=8;++k)if(k&&index+k>=0&&index+k<received){Source& nb=ring[(index+k)%17];if(nb.index!=index+k)throw std::runtime_error("T2 stale neighbour slot");ks.push_back(k);dense.emplace_back();v.push_back(motion(ref,nb,oy,ox,&dense.back()));}if(index==4){for(int i=0;i<int(ks.size());++i){trace_buffer(v[i],v[i].n,"vectors-"+std::to_string(ks[i])+".f32",stream);trace_buffer(dense[i],dense[i].n,"flow-"+std::to_string(ks[i])+".f32",stream);}}fit(v,ks,ref,oy,ox);std::vector<int> nearby,all;for(int i=0;i<int(ks.size());++i){all.push_back(i);if(std::abs(ks[i])<=2)nearby.push_back(i);}std::array<Image,3> res,longRes;int lnx=(w+16+ox)/8+1,lny=(h+16+oy)/8+1;
     const bool fullWindow = mode == "full";
     {
