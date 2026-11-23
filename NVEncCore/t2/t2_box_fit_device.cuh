@@ -18,8 +18,17 @@ __global__ void huber_wt(const double* res,const double* mad,double* wt,int S){
     double s=fmax(1e-4,1.4826*mad[i/S]);wt[i]=fmin(1.,1.345*s/fmax(fabs(res[i]),1e-12));
 }
 __global__ void huber_mean(const double* y,const double* wt,double* beta,int S){
-    int r=threadIdx.x;if(r>=32)return;double num=0,den=1e-9;const double* yy=y+(long long)r*S;const double* ww=wt+(long long)r*S;
-    for(int j=0;j<S;++j){num+=ww[j]*yy[j];den+=ww[j];}beta[r]=num/den;
+    // One block per series. Products and loads are done in parallel; the additions run in tile order on one thread
+    // (bit-identical to the host's sequential sum) from shared-memory staging, so the chain is add-latency bound.
+    __shared__ double st[256],sw[256];const int r=blockIdx.x,tid=threadIdx.x;const double* yy=y+(long long)r*S;const double* ww=wt+(long long)r*S;
+    double num=0,den=1e-9;
+    for(int j0=0;j0<S;j0+=256){
+        const int j=j0+tid;if(j<S){st[tid]=ww[j]*yy[j];sw[tid]=ww[j];}
+        __syncthreads();
+        if(tid==0){const int n=min(256,S-j0);for(int i=0;i<n;++i){num+=st[i];den+=sw[i];}}
+        __syncthreads();
+    }
+    if(tid==0)beta[r]=num/den;
 }
 static Buf<double> huber_translations_device(ScratchPool& pool,cudaStream_t stream,std::vector<Buf<float>>& v,const std::vector<int>& sel,std::array<std::array<double,2>,16>& g){
     const int S=int(sel.size());VecPtrs vp;for(int k=0;k<16;++k)vp.p[k]=v[k].p;
@@ -36,7 +45,7 @@ static Buf<double> huber_translations_device(ScratchPool& pool,cudaStream_t stre
         huber_wt<<<nb,256,0,stream>>>(res.p,mad.p,wt.p,S);
     };
     scale();
-    for(int it=0;it<21;++it){huber_mean<<<1,32,0,stream>>>(y.p,wt.p,beta.p,S);scale();}
+    for(int it=0;it<21;++it){huber_mean<<<32,256,0,stream>>>(y.p,wt.p,beta.p,S);scale();}
     auto b=beta.get(32,stream);for(int k=0;k<16;++k)for(int ax=0;ax<2;++ax)g[k][ax]=b[2*k+ax];
     return beta;
 }
@@ -82,12 +91,46 @@ __global__ void box_cand(const double* out,const double* g,IntList16 targets,int
 }
 // E layout: ((b*7)+c)*N+j; candidate c-1 of pair b: cand[c-1] + b*2N. In-place update of v[k] after all energies exist.
 struct CandPtrs { const float* p[6]; };
-__global__ void box_select(CandPtrs cp,VecPtrs vp,IntList16 targets,int B,int N,const float* E,const unsigned char* inner,double thr){
+__global__ void box_select(CandPtrs cp,VecPtrs vp,IntList16 targets,int B,int N,const float* E,const unsigned char* inner,double thr,unsigned char* choiceOut,int apply){
     long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(long long)B*N)return;int b=int(i/N),j=int(i%N),k=targets.k[b];
     float* vv=const_cast<float*>(vp.p[k]);
     float c0x=cp.p[0][(long long)b*2*N+2*j],c0y=cp.p[0][(long long)b*2*N+2*j+1];
-    if(!inner[j]){vv[2*j]=c0x;vv[2*j+1]=c0y;return;}
+    if(!inner[j]){if(choiceOut)choiceOut[(long long)b*N+j]=255;if(apply){vv[2*j]=c0x;vv[2*j+1]=c0y;}return;}
     const float* e=E+(long long)b*7*N+j;float best=e[0];for(int c=1;c<7;++c)best=fminf(best,e[(long long)c*N]);
     int choice=0;for(int c=1;c<7;++c)if((double(e[(long long)c*N])-double(best))*255<=thr){choice=c;break;}
-    if(choice){vv[2*j]=cp.p[choice-1][(long long)b*2*N+2*j];vv[2*j+1]=cp.p[choice-1][(long long)b*2*N+2*j+1];}
+    if(choiceOut)choiceOut[(long long)b*N+j]=(unsigned char)choice;
+    if(choice&&apply){vv[2*j]=cp.p[choice-1][(long long)b*2*N+2*j];vv[2*j+1]=cp.p[choice-1][(long long)b*2*N+2*j+1];}
+}
+// ---- fix 4: all candidates of all pairs in one launch; reference spectrum once per tile; block reductions instead of
+// 256-term serial sums per thread (FP32 summation order differs from `score`; same formulas otherwise). ----
+struct PairPtrs { const float* nb[4]; const float* v0[4]; };
+__device__ __forceinline__ float score_block_sum(float x,float* red){
+    for(int o=16;o;o>>=1)x+=__shfl_xor_sync(0xffffffffu,x,o);
+    if((threadIdx.x&31)==0)red[threadIdx.x>>5]=x;
+    __syncthreads();float s=0;for(int i=0;i<8;++i)s+=red[i];__syncthreads();return s;
+}
+__global__ void __launch_bounds__(256) score_multi(const float* ref,PairPtrs pp,CandPtrs cp,int B,const float* win,const float* var,float* E,int h,int w,int oy,int ox,int nx,int N){
+    __shared__ float2 b[272],tmp[272],tw[15];__shared__ float red[8];
+    const int tile=blockIdx.x,tid=threadIdx.x,idx=(tid>>4)*17+(tid&15);
+    if(tid<15)tw[tid]=T2_TW[tid];
+    const int fx0=tid&15,fy0=tid>>4;const int fx=fx0>=8?fx0-16:fx0,fy=fy0>=8?fy0-16:fy0;
+    const float vden=2*fmaxf(var[tile*256+tid]/8.f,1e-12f);const float wtid=win[tid];
+    const int ty=tile/nx*8-16-oy+(tid>>4),tx=tile%nx*8-16-ox+(tid&15);
+    float2 s0;
+    {
+        int y=max(-96,min(h+95,ty)),x=max(-96,min(w+95,tx));float val=ref[mirror_index(y,h)*w+mirror_index(x,w)];
+        float mean=score_block_sum(val*wtid,red);
+        b[idx]=make_float2((val-mean/64.f)*wtid,0);__syncthreads();t2_fft16_shared(b,tmp,tw,0,1);s0=b[idx];__syncthreads();
+    }
+    for(int bb=0;bb<B;++bb)for(int c=0;c<7;++c){
+        const float* vec=c==0?pp.v0[bb]:cp.p[c-1]+(size_t)bb*2*N;
+        const float vx=vec[2*tile],vy=vec[2*tile+1];const float rx=nearbyintf(vx),ry=nearbyintf(vy);
+        int y=max(-96,min(h+95,ty+(int)ry)),x=max(-96,min(w+95,tx+(int)rx));float val=pp.nb[bb][mirror_index(y,h)*w+mirror_index(x,w)];
+        float mean=score_block_sum(val*wtid,red);
+        b[idx]=make_float2((val-mean/64.f)*wtid,0);__syncthreads();t2_fft16_shared(b,tmp,tw,0,1);float2 z=b[idx];__syncthreads();
+        float angle=2*float(3.14159265358979323846)/16*(fx*(vx-rx)+fy*(vy-ry)),sn,cs;__sincosf(angle,&sn,&cs);
+        float dx=s0.x-(z.x*cs-z.y*sn),dy=s0.y-(z.x*sn+z.y*cs);
+        float q=tid?(dx*dx+dy*dy)/vden:0;float sum=score_block_sum(q,red);
+        if(tid==0)E[((size_t)bb*7+c)*N+tile]=sum/255.f;
+    }
 }

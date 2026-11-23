@@ -48,9 +48,25 @@ bool Engine::Impl::fit_box_device(std::vector<Buf<float>>& v,const std::vector<i
         fit_hash_report(v,targets,N,ref.index,stream);return true;
     }
     Buf<float> E(scratchPool,size_t(B)*7*N);
+    CandPtrs cp;for(int c=0;c<6;++c)cp.p[c]=cand[c].p;
+    if(level>=4){
+        PairPtrs pp{};for(int b=0;b<B;++b){int k=targets[b];pp.nb[b]=ring[(ref.index+ks[k])%17].image[0].b.p;pp.v0[b]=v[k].p;}
+        score_multi<<<N,256,0,stream>>>(ref.image[0].b.p,pp,cp,B,win.p,var.p,E.p,h,w,oy,ox,nx,N);
+    }else
     for(int b=0;b<B;++b){int k=targets[b];Source& nb=ring[(ref.index+ks[k])%17];
         for(int c=0;c<7;++c)score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:cand[c-1].p+size_t(b)*2*N,win.p,var.p,E.p+(size_t(b)*7+c)*N,h,w,oy,ox,nx);}
-    CandPtrs cp;for(int c=0;c<6;++c)cp.p[c]=cand[c].p;
-    box_select<<<blocks(B*N),256,0,stream>>>(cp,vp,tl,B,N,E.p,dInner.p,-2*std::log(.001));
+    const double thr=-2*std::log(.001);
+    static const bool scoreCheck=std::getenv("T2_NATIVE_FITCHECK")!=nullptr;
+    if(level>=4&&scoreCheck){ // compare choices of the new score against the legacy score on the same inputs, apply the new ones
+        Buf<float> E0(scratchPool,size_t(B)*7*N);Buf<unsigned char> chA(scratchPool,size_t(B)*N),chB(scratchPool,size_t(B)*N);
+        for(int b=0;b<B;++b){int k=targets[b];Source& nb=ring[(ref.index+ks[k])%17];
+            for(int c=0;c<7;++c)score<<<N,256,0,stream>>>(ref.image[0].b.p,nb.image[0].b.p,c==0?v[k].p:cand[c-1].p+size_t(b)*2*N,win.p,var.p,E0.p+(size_t(b)*7+c)*N,h,w,oy,ox,nx);}
+        box_select<<<blocks(B*N),256,0,stream>>>(cp,vp,tl,B,N,E0.p,dInner.p,thr,chA.p,0);
+        box_select<<<blocks(B*N),256,0,stream>>>(cp,vp,tl,B,N,E.p,dInner.p,thr,chB.p,0);
+        auto a=chA.get(size_t(B)*N,stream),c2=chB.get(size_t(B)*N,stream);size_t mism=0,tot=0;for(int b=0;b<B;++b)for(int j:inner){++tot;mism+=a[size_t(b)*N+j]!=c2[size_t(b)*N+j];}
+        auto eA=E0.get(size_t(B)*7*N,stream),eB=E.get(size_t(B)*7*N,stream);double maxrel=0;for(size_t i=0;i<eA.size();++i)maxrel=std::max(maxrel,double(std::abs(eA[i]-eB[i]))/std::max(1e-6,double(std::abs(eA[i]))));
+        fprintf(stderr,"T2SCORECHECK frame=%lld tiles=%zu choice_mismatch=%zu energy_max_rel_diff=%.3e\n",(long long)ref.index,tot,mism,maxrel);
+    }
+    box_select<<<blocks(B*N),256,0,stream>>>(cp,vp,tl,B,N,E.p,dInner.p,thr,nullptr,1);
     refined+=B;ck(cudaGetLastError());fit_hash_report(v,targets,N,ref.index,stream);return true;
 }
