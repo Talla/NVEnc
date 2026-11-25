@@ -372,6 +372,10 @@ public:
     virtual void setPicstruct(RGY_PICSTRUCT picstruct) override { frame.picstruct = picstruct; if (refFrameHost) refFrameHost->setPicstruct(picstruct); }
     virtual void setInputFrameId(int inputFrameId) override { frame.inputFrameId = inputFrameId; if (refFrameHost) refFrameHost->setInputFrameId(inputFrameId); }
     virtual void setFlags(RGY_FRAME_FLAGS flag) override { frame.flags = flag; if (refFrameHost) refFrameHost->setFlags(flag); };
+    void setSourceFrameType(RGY_FRAMETYPE type) override {
+        frame.sourceFrameType = type;
+        if (refFrameHost) refFrameHost->setSourceFrameType(type);
+    }
     virtual void clearDataList() override { frame.dataList.clear(); if (refFrameHost) refFrameHost->clearDataList(); };
     virtual const std::vector<std::shared_ptr<RGYFrameData>>& dataList() const override { return frame.dataList; };
     virtual std::vector<std::shared_ptr<RGYFrameData>>& dataList() override { return frame.dataList; };

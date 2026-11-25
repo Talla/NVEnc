@@ -81,6 +81,7 @@
 #include "NVEncFilterDenoiseFFT3D.h"
 #include "NVEncFilterSMDegrain.h"
 #include "NVEncFilterT2.h"
+#include "NVEncFilterBSeam.h"
 #include "NVEncFilterMsmooth.h"
 #include "NVEncFilterNvvfx.h"
 #include "NVEncFilterNGX.h"
@@ -495,7 +496,7 @@ RGY_ERR NVEncCore::InitInput(InEncodeVideoParam *inputParam, DeviceCodecCsp& HWD
 
     //入力モジュールが、エンコーダに返すべき色空間をセット
     const bool bOutputHighBitDepth = encodeIsHighBitDepth(inputParam);
-    if (inputParam->lossless || inputParam->vpp.t2.enable
+    if (inputParam->lossless || inputParam->vpp.t2.enable || inputParam->vpp.bseam.enable
         || (RGY_CSP_CHROMA_FORMAT[inputParam->outputCsp] == RGY_CHROMAFMT_RGB || RGY_CSP_CHROMA_FORMAT[inputParam->outputCsp] == RGY_CHROMAFMT_RGB_PACKED)
         || rgy_csp_has_alpha(inputParam->outputCsp)
         || inputParam->vpp.colorspace.enable) {
@@ -1619,6 +1620,7 @@ bool NVEncCore::enableCuvidResize(const InEncodeVideoParam *inputParam) const {
             || inputParam->vpp.dct.enable
             || inputParam->vpp.smooth.enable
             || inputParam->vpp.t2.enable
+            || inputParam->vpp.bseam.enable
             || inputParam->vpp.fft3d.enable
             || inputParam->vpp.msmooth.enable
             || inputParam->vppnv.nvvfxDenoise.enable
@@ -2985,8 +2987,6 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
         m_encFps *= 2;
     }
 
-    const bool cspConvRequired = inputFrame.csp != GetEncoderCSP(inputParam);
-
     //リサイザの出力すべきサイズ
     int resizeWidth  = 0;
     int resizeHeight = 0;
@@ -3051,7 +3051,6 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
         }
     }
 
-    std::vector<VppType> filterPipeline = InitFiltersCreateVppList(inputParam, cspConvRequired, cropRequired, resizeRequired);
     //読み込み時のcrop
     const sInputCrop *inputCrop = (cropRequired) ? &inputParam->input.crop : nullptr;
     const auto resize = std::make_pair(resizeWidth, resizeHeight);
@@ -3059,11 +3058,16 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     std::vector<std::unique_ptr<NVEncFilter>> vppCUDAFilters;
     // T2 consumes the original native sampling/code domain. The subsequent
     // conversion filters negotiate the encoder's chroma and bit depth.
+    if (inputParam->vpp.bseam.enable) {
+        auto err = AddFilterCUDA(vppCUDAFilters, inputFrame, VppType::CL_BSEAM, inputParam, inputCrop, resize, VuiFiltered);
+        if (err != RGY_ERR_NONE) return err;
+    }
     if(inputParam->vpp.t2.enable) {
         auto err=AddFilterCUDA(vppCUDAFilters,inputFrame,VppType::CL_T2,inputParam,inputCrop,resize,VuiFiltered);
         if(err!=RGY_ERR_NONE)return err;
     }
     const auto encCsp = GetEncoderCSP(inputParam);
+    auto filterPipeline = InitFiltersCreateVppList(inputParam, inputFrame.csp != encCsp, cropRequired, resizeRequired);
     auto filterCsp = encCsp;
     switch (filterCsp) {
     case RGY_CSP_NV12:  filterCsp = RGY_CSP_YV12; break;
@@ -3074,7 +3078,7 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
     case RGY_CSP_P010A: filterCsp = RGY_CSP_YUVA420_16; break;
     default: break;
     }
-    if(inputParam->vpp.t2.enable && filterPipeline.empty() && inputFrame.csp==encCsp) filterCsp=encCsp;
+    if((inputParam->vpp.t2.enable || inputParam->vpp.bseam.enable) && filterPipeline.empty() && inputFrame.csp==encCsp) filterCsp=encCsp;
     if (inputParam->vpp.afs.enable && RGY_CSP_CHROMA_FORMAT[inputFrame.csp] == RGY_CHROMAFMT_YUV444) {
         filterCsp = (RGY_CSP_BIT_DEPTH[inputFrame.csp] > 8) ? RGY_CSP_YUV444_16 : RGY_CSP_YUV444;
     }
@@ -3664,6 +3668,25 @@ RGY_ERR NVEncCore::AddFilterCUDA(std::vector<std::unique_ptr<NVEncFilter>>& cufi
         //入力フレーム情報を更新
         inputFrame = param->frameOut;
         m_encFps = param->baseFps;
+        return RGY_ERR_NONE;
+    }
+    if (vppType == VppType::CL_BSEAM) {
+        auto filter = std::make_unique<NVEncFilterBSeam>();
+        auto param = std::make_shared<NVEncFilterParam>();
+        param->frameIn = inputFrame;
+        param->frameOut = inputFrame;
+        if (encodeIsHighBitDepth(inputParam)) {
+            param->frameOut.csp = inputFrame.csp == RGY_CSP_NV12 ? RGY_CSP_P010 : RGY_CSP_YV12_16;
+            param->frameOut.bitdepth = 10;
+        }
+        param->baseFps = m_encFps;
+        param->bOutOverwrite = false;
+        NVEncCtxAutoLock(cxtlock(m_dev->vidCtxLock()));
+        auto status = filter->init(param, m_pLog);
+        if (status != RGY_ERR_NONE) return status;
+        m_pLastFilterParam = param;
+        inputFrame = param->frameOut;
+        cufilters.push_back(std::move(filter));
         return RGY_ERR_NONE;
     }
     if (vppType == VppType::CL_T2) {
@@ -4897,7 +4920,7 @@ RGY_ERR NVEncCore::initPipeline(const InEncodeVideoParam *prm) {
     PipelineTaskCUDAVpp *taskLastCudaVpp = nullptr;
     for (auto& vppblock : m_vpFilters) {
         m_pipelineTasks.push_back(std::make_unique<PipelineTaskCUDAVpp>(m_dev.get(), vppblock.vppnv, m_videoQualityMetric.get(),
-            m_encRunCtx->qEncodeBufferFree(), m_rgbAsYUV444, prm->cudaStreamOpt, prm->cudaMT, 1, prm->ctrl.threadParams.get(RGYThreadType::FILTER), m_pLog));
+            m_encRunCtx->qEncodeBufferFree(), m_rgbAsYUV444, prm->cudaStreamOpt, prm->cudaMT, prm->vpp.bseam.enable, 1, prm->ctrl.threadParams.get(RGYThreadType::FILTER), m_pLog));
         auto taskCudaVpp = dynamic_cast<PipelineTaskCUDAVpp *>(m_pipelineTasks.back().get());
         taskLastCudaVpp = taskCudaVpp;
         if (taskFirstCudaVpp == nullptr) {
@@ -4957,7 +4980,7 @@ RGY_ERR NVEncCore::initPipeline(const InEncodeVideoParam *prm) {
             taskLastCudaVpp->setEncodeTask(taskEnc);
         }
     } else {
-        m_pipelineTasks.push_back(std::make_unique<PipelineTaskOutputRaw>(m_dev.get(), m_pFileWriter.get(), 1, prm->ctrl.threadParams.get(RGYThreadType::MAIN), m_pLog));
+        m_pipelineTasks.push_back(std::make_unique<PipelineTaskOutputRaw>(m_dev.get(), m_pFileWriter.get(), m_timecode.get(), m_outputTimebase, 1, prm->ctrl.threadParams.get(RGYThreadType::MAIN), m_pLog));
     }
 
     if (m_pipelineTasks.size() == 0) {

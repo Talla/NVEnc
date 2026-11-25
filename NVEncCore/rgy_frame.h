@@ -219,6 +219,7 @@ public:
         return getInfo().flags;
     }
     virtual void setFlags(RGY_FRAME_FLAGS flags) = 0;
+    virtual void setSourceFrameType(RGY_FRAMETYPE) {}
     virtual void clearDataList() = 0;
     virtual const std::vector<std::shared_ptr<RGYFrameData>>& dataList() const = 0;
     virtual std::vector<std::shared_ptr<RGYFrameData>>& dataList() = 0;
@@ -230,6 +231,7 @@ public:
         setInputFrameId(frame->inputFrameId());
         setPicstruct(frame->picstruct());
         setFlags(frame->flags());
+        setSourceFrameType(frame->getInfo().sourceFrameType);
         setDataList(frame->dataList());
     }
 protected:
@@ -251,6 +253,7 @@ public:
     virtual void setPicstruct(RGY_PICSTRUCT picstruct) override { frame.picstruct = picstruct; }
     virtual void setInputFrameId(int id) override { frame.inputFrameId = id; }
     virtual void setFlags(RGY_FRAME_FLAGS frameflags) override { frame.flags = frameflags; }
+    void setSourceFrameType(RGY_FRAMETYPE type) override { frame.sourceFrameType = type; }
     virtual void clearDataList() override { frame.dataList.clear(); }
     virtual const std::vector<std::shared_ptr<RGYFrameData>>& dataList() const override { return frame.dataList; }
     virtual std::vector<std::shared_ptr<RGYFrameData>>& dataList() override { return frame.dataList; }
@@ -275,6 +278,7 @@ public:
     virtual void setPicstruct(RGY_PICSTRUCT picstruct) override { frame.picstruct = picstruct; }
     virtual void setInputFrameId(int id) override { frame.inputFrameId = id; }
     virtual void setFlags(RGY_FRAME_FLAGS frameflags) override { frame.flags = frameflags; }
+    void setSourceFrameType(RGY_FRAMETYPE type) override { frame.sourceFrameType = type; }
     virtual void clearDataList() override { frame.dataList.clear(); }
     virtual const std::vector<std::shared_ptr<RGYFrameData>>& dataList() const override { return frame.dataList; }
     virtual std::vector<std::shared_ptr<RGYFrameData>>& dataList() override { return frame.dataList; }

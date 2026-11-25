@@ -124,6 +124,7 @@ RGY_ERR NVEncFilter::filter(RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFr
                 ppOutputFrames[0]->timestamp = pInputFrame->timestamp;
                 ppOutputFrames[0]->duration  = pInputFrame->duration;
                 ppOutputFrames[0]->inputFrameId = pInputFrame->inputFrameId;
+                ppOutputFrames[0]->sourceFrameType = pInputFrame->sourceFrameType;
             }
         }
         for (int i = 0; i < nOutFrame; i++) {

@@ -41,6 +41,9 @@ $(PROGRAM): $(DEPS) $(DEPCUS) $(OBJCUS) $(OBJS) $(OBJBINS) $(OBJBINHS) $(OBJPYWS
 
 # MCWiener alone requires SM86+ PTX and preserves FP32 expression order.
 T2_NVCCFLAGS = $(filter-out --generate-code arch=compute_% -gencode% --use_fast_math -use_fast_math,$(NVCCFLAGS)) -gencode=arch=compute_86,code=compute_86 --fmad=false
+NVEncCore/bseam/bseam_kernels.o: NVEncCore/bseam/bseam_kernels.cu
+	$(NVCC) -c $(filter-out --use_fast_math -use_fast_math,$(NVCCFLAGS)) -o $@ $<
+
 NVEncCore/t2/t2_native.o: NVEncCore/t2/t2_native.cu
 	$(NVCC) -c $(T2_NVCCFLAGS) -o $@ $<
 

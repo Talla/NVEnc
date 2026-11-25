@@ -165,6 +165,7 @@ enum class VppType : int {
     CL_DENOISE_FFT3D,
     CL_SMDEGRAIN,
     CL_T2,
+    CL_BSEAM,
     CL_MSMOOTH,
 
     CL_LIBPLACEBO_SHADER,
@@ -2076,6 +2077,10 @@ struct VppDenoiseFFT3D {
     int effectiveTbsize() const { return (tbsize > 0) ? tbsize : (temporal ? 3 : 1); }
 };
 
+struct VppBSeam {
+    bool enable = false;
+};
+
 struct VppT2 {
     bool enable = false;
     tstring mode = _T("box"), profile, pp, iso;
@@ -2387,6 +2392,7 @@ struct RGYParamVpp {
     VppDenoiseFFT3D fft3d;
     VppSMDegrain smdegrain;
     VppT2 t2;
+    VppBSeam bseam;
     VppMsmooth msmooth;
     std::vector<VppSubburn> subburn;
     std::vector<VppLibplaceboShader> libplacebo_shader;

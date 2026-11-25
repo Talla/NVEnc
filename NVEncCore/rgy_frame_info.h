@@ -28,7 +28,7 @@
 #ifndef _RGY_FRAME_INFO_H_
 #define _RGY_FRAME_INFO_H_
 
-#include "convert_csp.h"
+#include "rgy_def.h"
 
 class RGYFrameData;
 
@@ -42,6 +42,7 @@ struct RGYFrameInfo {
     RGY_MEM_TYPE mem_type;
     RGY_PICSTRUCT picstruct;
     RGY_FRAME_FLAGS flags;
+    RGY_FRAMETYPE sourceFrameType = RGY_FRAMETYPE_UNKNOWN;
     int inputFrameId;
     std::vector<std::shared_ptr<RGYFrameData>> dataList;
     bool singleAlloc;
@@ -101,6 +102,7 @@ static void copyFramePropWithoutRes(RGYFrameInfo *dst, const RGYFrameInfo *src) 
     dst->duration = src->duration;
     dst->inputFrameId = src->inputFrameId;
     dst->flags = src->flags;
+    dst->sourceFrameType = src->sourceFrameType;
     dst->dataList = src->dataList;
 }
 

@@ -1331,6 +1331,10 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
     </CudaCompile>
     <ClCompile Include="NVEncFilterT2.cpp" />
+    <ClCompile Include="NVEncFilterBSeam.cpp" />
+    <CudaCompile Include="bseam\bseam_kernels.cu">
+      <FastMath>false</FastMath>
+    </CudaCompile>
     <CudaCompile Include="t2\t2_native.cu">
       <FastMath>false</FastMath>
       <AdditionalOptions>--fmad=false %(AdditionalOptions)</AdditionalOptions>
@@ -1499,6 +1503,8 @@
     <ClInclude Include="NVEncFilterDenoiseFFT3D.cuh" />
     <ClInclude Include="NVEncFilterDenoiseFFT3D.h" />
     <ClInclude Include="NVEncFilterT2.h" />
+    <ClInclude Include="NVEncFilterBSeam.h" />
+    <ClInclude Include="bseam\bseam_kernels.h" />
     <ClInclude Include="t2\t2_native.h" />
     <ClInclude Include="NVEncFilterSMDegrain.h" />
     <ClInclude Include="NVEncFilterSMDegrain.cuh" />

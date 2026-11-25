@@ -765,6 +765,7 @@ nvenccore_sources = files(
   'NVEncCore/NVEncFilterCustom.cpp',
   'NVEncCore/NVEncFilterDelogo.cpp',
   'NVEncCore/NVEncFilterT2.cpp',
+  'NVEncCore/NVEncFilterBSeam.cpp',
   'NVEncCore/NVEncFilterDenoiseFFT3D.cpp',
   'NVEncCore/NVEncFilterDenoiseGauss.cpp',
   'NVEncCore/NVEncFilterLibplacebo.cpp',
@@ -982,6 +983,12 @@ t2_native_lib = static_library('mcwiener_native',
   include_directories: common_include_dirs,
 )
 
+bseam_native_lib = static_library('bseam_native',
+  'NVEncCore/bseam/bseam_kernels.cu',
+  cuda_args: gpu_code_gen + ['--cudart=static', '-std=c++17'] + cuda_include_args,
+  include_directories: common_include_dirs,
+)
+
 # ==============================================================================
 # 依存関係まとめ
 # ==============================================================================
@@ -1049,7 +1056,7 @@ executable('nvencc',
   cuda_args: cuda_args,
   include_directories: common_include_dirs,
   dependencies: all_deps,
-  link_with: simd_libs + [t2_native_lib],
+  link_with: simd_libs + [t2_native_lib, bseam_native_lib],
   install: true,
 )
 

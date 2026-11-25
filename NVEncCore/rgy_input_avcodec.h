@@ -96,6 +96,7 @@ typedef struct FramePos {
     uint8_t flags;    //flags (キーフレームならAV_PKT_FLAG_KEY)
     uint8_t pic_struct; //RGY_PICSTRUCT_xxx
     uint8_t repeat_pict; //通常は1, RFFなら2+
+    uint8_t nal_ref; // 0 unknown, 1 non-reference, 2 reference
     uint8_t pict_type; //I,P,Bフレーム
 } FramePos;
 
@@ -106,7 +107,7 @@ typedef struct FramePos {
 #endif
 
 static FramePos framePosInit() {
-    FramePos pos;
+    FramePos pos{};
     pos.pts = 0;
     pos.dts = 0;
     pos.duration = 0;
@@ -123,7 +124,7 @@ static FramePos framePos(int64_t pts, int64_t dts,
     int duration, int duration2 = 0,
     int poc = FRAMEPOS_POC_INVALID,
     uint8_t flags = 0, uint8_t pic_struct = RGY_PICSTRUCT_FRAME, uint8_t repeat_pict = 0, uint8_t pict_type = 0) {
-    FramePos pos;
+    FramePos pos{};
     pos.pts = pts;
     pos.dts = dts;
     pos.duration = duration;
@@ -756,6 +757,7 @@ struct AVDemuxVideo {
     int                       leadingFrames;         //最初のキーフレームより前に表示されるフレーム数 (open GOP)
     int64_t                   leadingMinPts;         //それらのフレームの最小pts
     std::vector<int64_t>      leadingPts;            //それらのフレームのpts (昇順, keep時に確定)
+    std::vector<FramePos>     leadingPicturePositions; // Original H.264 metadata excluded from FramePosList.
     bool                      leadingFramesKept;     //それらのフレームを残す (streamFirstKeyPts = leadingMinPts)
     AVBSFContext             *bsfcCtx;               //必要なら使用するbitstreamfilter
     uint8_t                  *extradata;             //動画のヘッダ情報
@@ -917,6 +919,8 @@ public:
 
     //フレーム情報構造へのポインタを返す
     FramePosList *GetFramePosList();
+    RGY_FRAMETYPE GetSourceFrameType(const FramePos& pos, int64_t pts,
+                                    int decodedType = AV_PICTURE_TYPE_NONE) const;
 
     virtual rgy_rational<int> getInputTimebase() const override;
 

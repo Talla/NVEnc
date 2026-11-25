@@ -1303,6 +1303,7 @@ protected:
     RGYQueueMPMP<FrameFlags> m_dataFlag;
     RGYRunState m_state;
     int m_decOutFrames;
+    uint32_t m_sourcePicturePosIdx = UINT32_MAX;
     int64_t m_hwDecFirstPts;
     bool m_gotFrameAfterFirstPts; //最初のフレームより前のptsで出てきたフレームのカウント
 #if THREAD_DEC_USE_FUTURE
@@ -1577,6 +1578,11 @@ protected:
             surfDecOut->setPicstruct(inputPicstruct);
             surfDecOut->setTimestamp(dispInfo.timestamp);
             surfDecOut->setInputFrameId(m_decOutFrames++);
+            if (auto reader = dynamic_cast<RGYInputAvcodec*>(m_input)) {
+                const auto pts = dispInfo.timestamp;
+                const auto pos = reader->GetFramePosList()->findpts(pts, &m_sourcePicturePosIdx);
+                surfDecOut->setSourceFrameType(reader->GetSourceFrameType(pos, pts));
+            }
             surfDecOut->setFlags(getDataFlag(surfDecOut->timestamp()));
 
             surfDecOut->clearDataList();
@@ -3318,6 +3324,7 @@ protected:
     bool m_rgbAsYUV444;
     int m_cudaStreamOpt;
     int m_cudaMT;
+    bool m_singleFilterStream;
     cudaEvent_t m_eventDefaultToFilter;
     cudaStream_t m_streamFilter;
     cudaStream_t m_streamDownload;
@@ -3325,10 +3332,10 @@ protected:
     PipelineTaskNVEncode *m_encode;
 public:
     PipelineTaskCUDAVpp(NVGPUInfo *dev, std::vector<std::unique_ptr<NVEncFilter>>& vppfilters, NVEncFilterSsim *videoMetric,
-    RGYQueueMPMP<CUFrameEnc *>& qEncodeBufferFree, bool rgbAsYUV444, int cudaStreamOpt, int cudaMT, int outMaxQueueSize, RGYParamThread threadParam, std::shared_ptr<RGYLog> log) :
+    RGYQueueMPMP<CUFrameEnc *>& qEncodeBufferFree, bool rgbAsYUV444, int cudaStreamOpt, int cudaMT, bool singleFilterStream, int outMaxQueueSize, RGYParamThread threadParam, std::shared_ptr<RGYLog> log) :
         PipelineTask(PipelineTaskType::CUDA, dev, outMaxQueueSize, false, threadParam, log), m_vpFilters(vppfilters), m_videoMetric(videoMetric),
         m_frameReleaseData(dev->vidCtxLock(), 4, threadParam), m_inFrameUseFinEvent(), m_qEncodeBufferFree(qEncodeBufferFree), m_rgbAsYUV444(rgbAsYUV444),
-        m_cudaStreamOpt(cudaStreamOpt), m_cudaMT(cudaMT), m_eventDefaultToFilter(nullptr),m_streamFilter(nullptr), m_streamDownload(nullptr), m_cuvidPrev(), m_encode(nullptr) {
+        m_cudaStreamOpt(cudaStreamOpt), m_cudaMT(cudaMT), m_singleFilterStream(singleFilterStream), m_eventDefaultToFilter(nullptr),m_streamFilter(nullptr), m_streamDownload(nullptr), m_cuvidPrev(), m_encode(nullptr) {
 
         NVEncCtxAutoLock(ctxlock(m_dev->vidCtxLock()));
         if (cudaStreamOpt > 1) {
@@ -3436,6 +3443,14 @@ public:
                 // cuvidでmapする際に、CUDAのdefault streamを使用するようで、これと同期する必要がある
                 // これを行わないと、cuvidの処理が終わる前に(?)CUDAの処理が行われておかしくなるようである
                 streamFilter = cudaStreamPerThread;
+                if (m_singleFilterStream && streamFilter != m_streamFilter) {
+                    // The filter's ring and workspace are shared by input and drain calls.
+                    auto err = cudaEventRecord(m_eventDefaultToFilter, streamFilter);
+                    if (err != cudaSuccess) return err_to_rgy(err);
+                    err = cudaStreamWaitEvent(m_streamFilter, m_eventDefaultToFilter, 0);
+                    if (err != cudaSuccess) return err_to_rgy(err);
+                    streamFilter = m_streamFilter;
+                }
                 filterframes.push_back(std::make_pair(surfVppInCuvid->getInfo(), 0u));
             } else if (auto surfVppInCU = taskSurf->surf().cubuf(); surfVppInCU != nullptr) {
                 filterframes.push_back(std::make_pair(surfVppInCU->getInfo(), 0u));
@@ -3466,13 +3481,6 @@ public:
                         return sts_filter;
                     }
                 }
-                if (nOutFrames == 0) {
-                    if (drain) {
-                        filterframes.front().second++;
-                        continue;
-                    }
-                    return RGY_ERR_NONE;
-                }
                 if (ifilter == 0 && frame) { //最初のフィルタなら転送なので、イベントをここでセットする
                     std::shared_ptr<cudaEvent_t> cudaEvent;
                     {
@@ -3482,12 +3490,20 @@ public:
                             PrintMes(RGY_LOG_ERROR, _T("Failed to get cuda event.\n"));
                             return RGY_ERR_UNKNOWN;
                         }
-                        cudaEventRecord(*cudaEvent, streamFilter);
+                        const auto err = cudaEventRecord(*cudaEvent, streamFilter);
+                        if (err != cudaSuccess) return err_to_rgy(err);
                     }
                     //ここでinput frameの参照を m_prevInputFrame で保持するようにして、CUDAによるフレームの処理が完了しているかを確認できるようにする
                     //これを行わないとこのフレームが再度使われてしまうことになる
                     //NVEncCtxAutoLockは内部で行われるため不要
                     m_frameReleaseData.addFrame(frame, cudaEvent);
+                }
+                if (nOutFrames == 0) {
+                    if (drain) {
+                        filterframes.front().second++;
+                        continue;
+                    }
+                    return RGY_ERR_NONE;
                 }
                 // cuvidとの同期のため、cudaStreamPerThreadを最初に使った場合でも、その次のフィルタはm_streamFilterを使用するようにする
                 if (streamFilter != m_streamFilter) {
@@ -3588,7 +3604,7 @@ public:
             auto streamLastFilter = streamFilter;
             RGYFrameInfo& ssimTarget = (frameVppOutInfo.mem_type == RGY_MEM_TYPE_CPU) ? filterframes.front().first : frameVppOutInfo;
             if (frameVppOutInfo.mem_type == RGY_MEM_TYPE_CPU) {
-                if (m_vpFilters.size() > 1) {
+                if (m_vpFilters.size() > 1 && !m_singleFilterStream) {
                     // 最後のフィルタ(=copyDtoH)だけではに場合は、専用のstream(m_streamDownload)を使用するようにして高速化
                     if (streamLastFilter != cudaStreamPerThread) {
                         streamLastFilter = m_streamDownload;
@@ -3657,6 +3673,7 @@ public:
             frameVppOut.frame()->setInputFrameId(frameVppOutInfo.inputFrameId);
             frameVppOut.frame()->setPicstruct(frameVppOutInfo.picstruct);
             frameVppOut.frame()->setFlags(frameVppOutInfo.flags);
+            frameVppOut.frame()->setSourceFrameType(frameVppOutInfo.sourceFrameType);
             frameVppOut.frame()->setDataList(frameVppOutInfo.dataList);
 
             auto outputSurf = std::make_unique<PipelineTaskOutputSurf>(m_dev->vidCtxLock(), frameVppOut, frame, cudaEvent);
@@ -3673,9 +3690,13 @@ public:
 
 class PipelineTaskOutputRaw : public PipelineTask {
     RGYOutput *m_writer;
+    RGYTimecode *m_timecode;
+    rgy_rational<int> m_timebase;
 public:
-    PipelineTaskOutputRaw(NVGPUInfo *dev, RGYOutput *writer, int outMaxQueueSize, RGYParamThread threadParam, std::shared_ptr<RGYLog> log) :
-        PipelineTask(PipelineTaskType::OUTPUTRAW, dev, outMaxQueueSize, false, threadParam, log), m_writer(writer) {
+    PipelineTaskOutputRaw(NVGPUInfo *dev, RGYOutput *writer, RGYTimecode *timecode,
+                          rgy_rational<int> timebase, int outMaxQueueSize, RGYParamThread threadParam, std::shared_ptr<RGYLog> log) :
+        PipelineTask(PipelineTaskType::OUTPUTRAW, dev, outMaxQueueSize, false, threadParam, log),
+        m_writer(writer), m_timecode(timecode), m_timebase(timebase) {
     };
     virtual ~PipelineTaskOutputRaw() {
         if (m_writer) {
@@ -3689,6 +3710,9 @@ public:
     virtual RGY_ERR sendFrame(std::unique_ptr<PipelineTaskOutput>& frame) override {
         if (!frame) {
             return RGY_ERR_MORE_DATA;
+        }
+        if (m_timecode) {
+            m_timecode->write(frame->timestamp(), m_timebase);
         }
         m_inFrames++;
         m_outQeueue.push_back(std::move(frame));

@@ -3688,3 +3688,8 @@ The CUDA toolchain's existing cuFFT runtime is required. The Windows binary reta
 MCWiener `strength=<float>` is exactly the lab temporal coefficient `c`, default `1`, finite and nonnegative. For each frequency bin, `A = d2 / max(d2 + strength * 2 * var * (1-rho), 1e-30)`; larger values admit more neighboring temporal support. The reviewed variance multiplier remains `8`; motion, profile noise, mode selection and Wiener variance are not rescaled. `strength=0` is not bypass: Wiener/S1 still filter. Default1 uses the original launcher unchanged; nondefault strength evaluates only this ratio in FP64 to support every representable finite nonnegative double without an arbitrary cap.
 
 When derived confidence leaves the preserved FP32 fit envelope, MCWiener explicitly logs/counts native FP64 definition fits: direct separable box sums for box mode, exact FP64 lower-median initialization plus the existing FP64 local-fit kernel for full mode. The profile and fit definitions are retained; no torch/SAT proxy or new confidence model is used. Nonfinite/invalid FP64-domain state remains an error.
+
+
+### --vpp-bseam
+
+Repairs seams in eligible H.264 B pictures from Sony AX700 footage. Requires progressive 8-bit NV12 or YV12 input. Runs before MCWiener when both filters are enabled. With 10-bit output, the repair retains quarter-code luma precision.

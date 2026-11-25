@@ -3152,6 +3152,10 @@ int parse_one_vpp_option(const TCHAR *option_name, const TCHAR *strInput[], int 
         }
         return 0;
     }
+    if (IS_OPTION("vpp-bseam") && ENCODER_NVENC) {
+        vpp->bseam.enable = true;
+        return 0;
+    }
     if ((IS_OPTION("vpp-mcwiener") || IS_OPTION("vpp-t2")) && ENCODER_NVENC) {
         vpp->t2.enable = true;
         if (i + 1 >= nArgNum || strInput[i + 1][0] == _T('-')) {
@@ -8281,6 +8285,7 @@ tstring gen_cmd(const RGYParamVpp *param, const RGYParamVpp *defaultPrm, bool sa
             cmd << _T(" --vpp-smooth");
         }
     }
+    if (param->bseam.enable) cmd << _T(" --vpp-bseam");
     if (param->t2.enable) {
         cmd << _T(" --vpp-mcwiener \"mode=") << param->t2.mode << _T(",profile=") << param->t2.profile
             << _T(",pp=") << param->t2.pp << _T(",iso=") << param->t2.iso << _T(",strength=") << std::setprecision(17) << param->t2.strength << _T("\"");
@@ -10069,6 +10074,7 @@ tstring gen_cmd_help_vpp() {
 #endif
 #if ENABLE_VPP_FILTER_FFT3D
     str += strsprintf(_T("\n")
+        _T("   --vpp-bseam                 Repair AX700 H.264 B-picture seams (progressive 8-bit YUV420).\n")
         _T("   --vpp-mcwiener mode=<plain|box|full>,profile=<path>,pp=<key>,iso=<entry>[,strength=<float>]\n")
         _T("     strength: exact lab c, finite >=0, default1; larger admits more temporal support.\n")
         _T("     strength=0 is not bypass: Wiener/S1 remain; fixed variance multiplier8.\n")

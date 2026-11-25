@@ -138,6 +138,7 @@ AVDemuxVideo::AVDemuxVideo() :
     leadingFrames(0),
     leadingMinPts(AV_NOPTS_VALUE),
     leadingPts(),
+    leadingPicturePositions(),
     leadingFramesKept(false),
     bsfcCtx(nullptr),
     extradata(nullptr),
@@ -2666,6 +2667,27 @@ FramePosList *RGYInputAvcodec::GetFramePosList() {
     return &m_Demux.frames;
 }
 
+RGY_FRAMETYPE RGYInputAvcodec::GetSourceFrameType(const FramePos& pos, int64_t pts, int decodedType) const {
+    if (pts == AV_NOPTS_VALUE) return RGY_FRAMETYPE_UNKNOWN;
+    const auto* picture = &pos;
+    if (picture->pts != pts || !picture->nal_ref) {
+        if (!m_Demux.video.leadingFramesKept) return RGY_FRAMETYPE_UNKNOWN;
+        const auto& leading = m_Demux.video.leadingPicturePositions;
+        const auto it = std::find_if(leading.begin(), leading.end(), [pts](const FramePos& p) { return p.pts == pts; });
+        if (it == leading.end()) return RGY_FRAMETYPE_UNKNOWN;
+        picture = &*it;
+    }
+
+    RGY_FRAMETYPE type;
+    switch (decodedType == AV_PICTURE_TYPE_NONE ? picture->pict_type : decodedType) {
+    case AV_PICTURE_TYPE_I: type = RGY_FRAMETYPE_I; break;
+    case AV_PICTURE_TYPE_P: type = RGY_FRAMETYPE_P; break;
+    case AV_PICTURE_TYPE_B: type = RGY_FRAMETYPE_B; break;
+    default: return RGY_FRAMETYPE_UNKNOWN;
+    }
+    return picture->nal_ref == 2 ? type | RGY_FRAMETYPE_REF : type;
+}
+
 //seektoで指定された時刻の範囲内かチェックする
 bool RGYInputAvcodec::checkTimeSeekTo(int64_t pts, rgy_rational<int> timebase, float marginSec) {
     if (m_seek.second <= 0.0f
@@ -2923,6 +2945,41 @@ void RGYInputAvcodec::sortAndPushSubtitlePacket() {
     m_Demux.format.subPacketTemporalBufferIntervalCount = -1;
 }
 
+static uint8_t h264ReferenceStatus(const AVPacket& packet, const AVCodecParameters& codec) {
+    if (codec.codec_id != AV_CODEC_ID_H264 || packet.size <= 0) return 0;
+    uint8_t status = 0;
+    const auto observe = [&](uint8_t header) {
+        if (header & 0x80) return false;
+        const auto type = header & 31;
+        if (type != 1 && type != 5) return true;
+        const uint8_t current = (header & 0x60) ? 2 : 1;
+        if (status && current != status) return false;
+        status = current;
+        return true;
+    };
+    const auto* data = packet.data;
+    const size_t size = packet.size;
+    if (codec.extradata_size >= 5 && codec.extradata[0] == 1) {
+        const size_t lengthBytes = (codec.extradata[4] & 3) + 1;
+        for (size_t i = 0; i < size;) {
+            if (size - i < lengthBytes) return 0;
+            uint32_t length = 0;
+            for (size_t j = 0; j < lengthBytes; ++j) length = (length << 8) | data[i++];
+            if (!length || length > size - i || !observe(data[i])) return 0;
+            i += length;
+        }
+    } else {
+        // Recognizes either Annex B start code, including leading zero bytes.
+        for (size_t i = 0; i + 3 < size; ++i) {
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                if (!observe(data[i + 3])) return 0;
+                i += 3;
+            }
+        }
+    }
+    return status;
+}
+
 std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcodec::getSample(bool bTreatFirstPacketAsKeyframe) {
     int i_samples = 0;
     int ret_read_frame = 0;
@@ -2962,6 +3019,7 @@ std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcod
                 const auto timestamp = (pkt->pts == AV_NOPTS_VALUE) ? pkt->dts : pkt->pts;
                 AddMessage(RGY_LOG_WARN, _T("corrupt packet in video: %lld (%s)\n"), (long long int)timestamp, getTimestampString(timestamp, m_Demux.video.stream->time_base).c_str());
             }
+            const auto nalRef = h264ReferenceStatus(*pkt, *m_Demux.video.stream->codecpar);
             if (m_Demux.video.bsfcCtx) {
                 auto ret = av_bsf_send_packet(m_Demux.video.bsfcCtx, pkt.get());
                 if (ret < 0) {
@@ -3002,6 +3060,7 @@ std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcod
             pos.poc = FRAMEPOS_POC_INVALID;
             pos.flags = (uint8_t)pkt->flags;
             pos.pict_type = AV_PICTURE_TYPE_NONE;
+            pos.nal_ref = nalRef;
             if (m_Demux.video.pParserCtx) {
                 uint8_t* dummy = nullptr;
                 int dummy_size = 0;
@@ -3068,6 +3127,9 @@ std::tuple<int, std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> RGYInputAvcod
                     if (!m_Demux.video.leadingFramesKept) {
                         m_Demux.video.leadingFrames++;
                         m_Demux.video.leadingPts.push_back(timestamp);
+                        if (m_Demux.format.keepLeadingFrames && pos.nal_ref && pos.pts == timestamp) {
+                            m_Demux.video.leadingPicturePositions.push_back(pos);
+                        }
                         if (m_Demux.video.leadingMinPts == AV_NOPTS_VALUE || timestamp < m_Demux.video.leadingMinPts) {
                             m_Demux.video.leadingMinPts = timestamp;
                         }
@@ -3578,6 +3640,7 @@ RGY_ERR RGYInputAvcodec::LoadNextFrameInternal(RGYFrame *pSurface) {
             }
         }
         pSurface->setFlags(flags);
+        pSurface->setSourceFrameType(GetSourceFrameType(findPos, m_Demux.video.frame->pts, m_Demux.video.frame->pict_type));
         pSurface->setTimestamp(m_Demux.video.frame->pts);
         pSurface->setDuration(rgy_avframe_get_duration(m_Demux.video.frame));
         pSurface->setPicstruct((m_inputVideoInfo.picstruct == RGY_PICSTRUCT_AUTO) ? picstruct_avframe_to_rgy(m_Demux.video.frame) : m_inputVideoInfo.picstruct);

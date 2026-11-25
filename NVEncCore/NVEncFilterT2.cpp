@@ -32,8 +32,8 @@ bool semi(RGY_CSP c){return c==RGY_CSP_NV12||c==RGY_CSP_P010||c==RGY_CSP_NV16||c
 native_t2::FrameView view(const RGYFrameInfo& frame){native_t2::FrameView out{};auto ss=sampling(frame.csp);const bool sp=semi(frame.csp);int bytes=RGY_CSP_BIT_DEPTH[frame.csp]>8?2:1;int bits=RGY_CSP_BIT_DEPTH[frame.csp];
     // Semi-planar decoder buffers contain nominal-bit codes in the high bits.
     // Keep exact nominal / (2^bits-1) scaling when reader provenance retains bitdepth.
-    if(sp&&bytes==2&&frame.bitdepth>=9&&frame.bitdepth<16)bits=frame.bitdepth;
-    for(int p=0;p<3;++p){auto plane=getPlane(&frame,(RGY_PLANE)p);void* ptr=plane.ptr[0];size_t pitch=plane.pitch[0];if(sp&&p){auto uv=getPlane(&frame,RGY_PLANE_U);ptr=(void*)((char*)uv.ptr[0]+(p==2?bytes:0));pitch=uv.pitch[0];}out.plane[p]={ptr,pitch,frame.width/(p?ss.first:1),frame.height/(p?ss.second:1),bytes,sp&&bytes==2?16-bits:0,bits,sp&&p?2:1};}return out;
+    if((sp||frame.csp==RGY_CSP_YV12_16)&&bytes==2&&frame.bitdepth>=9&&frame.bitdepth<16)bits=frame.bitdepth;
+    for(int p=0;p<3;++p){auto plane=getPlane(&frame,(RGY_PLANE)p);void* ptr=plane.ptr[0];size_t pitch=plane.pitch[0];if(sp&&p){auto uv=getPlane(&frame,RGY_PLANE_U);ptr=(void*)((char*)uv.ptr[0]+(p==2?bytes:0));pitch=uv.pitch[0];}out.plane[p]={ptr,pitch,frame.width/(p?ss.first:1),frame.height/(p?ss.second:1),bytes,bytes==2?16-bits:0,bits,sp&&p?2:1};}return out;
 }
 }
 NVEncFilterT2::NVEncFilterT2():m_received(0),m_emitted(0),m_draining(false),m_errors(0),m_fp64Logged(false){m_name=_T("mcwiener");}
